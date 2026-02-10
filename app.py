@@ -16,10 +16,8 @@ DEFAULT_STRIKE = 400.00
 DEFAULT_TIME = 1.0
 DEFAULT_VOL = 0.2
 DEFAULT_RATE = 0.04
-
-# Defaults for Spread Tab
-DEFAULT_SPREAD_A = "KO"
-DEFAULT_SPREAD_B = "PEP"
+DEFAULT_SPREAD_A = "SPY"
+DEFAULT_SPREAD_B = "GLD"
 
 colors = {
     'background': '#1e1e1e', 'text': '#e0e0e0', 'card_bg': '#2c2c2c',
@@ -32,7 +30,8 @@ layout_settings = dict(
     paper_bgcolor=colors['card_bg'],
     plot_bgcolor=colors['card_bg'],
     font=dict(color=colors['text']),
-    hovermode="x unified"
+    hovermode="x unified",
+    autosize=True  # Important for mobile responsiveness
 )
 
 # -----------------------------------------------------------------------------
@@ -48,7 +47,6 @@ def get_initial_price(ticker_symbol):
         pass
     return 400.00
 
-# Initialize Defaults
 initial_spot = get_initial_price(DEFAULT_TICKER)
 initial_strike = initial_spot
 
@@ -95,7 +93,10 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_spot.add_trace(go.Scatter(x=spot_range, y=call_prices, mode='lines', name='Call Value', line=dict(color=colors['call_text'])))
     fig_spot.add_trace(go.Scatter(x=spot_range, y=put_prices, mode='lines', name='Put Value', line=dict(color=colors['put_text'])))
     fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#888", annotation_text="Spot")
-    fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)', **layout_settings)
+    
+    # Reduced margins for mobile
+    fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)', 
+                           margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
     
     greeks_call = [calculate_greeks(s, K, T, r, sigma, 'call') for s in spot_range]
     delta_c, gamma_c, theta_c, vega_c = zip(*greeks_call)
@@ -105,25 +106,41 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_greeks.add_trace(go.Scatter(x=spot_range, y=gamma_c, name='Gamma', line=dict(color=colors['accent']), showlegend=False), 1, 2)
     fig_greeks.add_trace(go.Scatter(x=spot_range, y=theta_c, name='Call Theta', line=dict(color=colors['call_text']), showlegend=False), 2, 1)
     fig_greeks.add_trace(go.Scatter(x=spot_range, y=vega_c, name='Vega', line=dict(color=colors['accent']), showlegend=False), 2, 2)
-    fig_greeks.update_layout(title="Greeks Sensitivity", height=600, **layout_settings)
+    
+    fig_greeks.update_layout(title="Greeks Sensitivity", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
     return fig_spot, fig_greeks
 
 # -----------------------------------------------------------------------------
-# 3. APP LAYOUT
+# 3. APP LAYOUT & STYLES (Mobile Optimized)
 # -----------------------------------------------------------------------------
-app = dash.Dash(__name__, suppress_callback_exceptions=True, title='Equity Research Dashboard')
+app = dash.Dash(__name__, suppress_callback_exceptions=True, title='Equity Research Dashboard',
+                meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
 
+# Sidebar: Flexible width, minimum 350px, stacks on small screens
 SIDEBAR_STYLE = {
-    'flex': '0 0 400px', 'width': '400px', 'minHeight': '800px',
+    'flex': '1 1 350px', 
     'backgroundColor': colors['card_bg'], 'padding': '20px',
     'borderRadius': '10px', 'boxSizing': 'border-box',
-    'display': 'flex', 'flexDirection': 'column'
+    'display': 'flex', 'flexDirection': 'column',
+    'marginBottom': '20px'
 }
 
+# Content: Flexible width, takes remaining space or stacks
 CONTENT_STYLE = {
-    'flex': '1', 'backgroundColor': colors['card_bg'], 'padding': '20px',
-    'borderRadius': '10px', 'minHeight': '800px', 'boxSizing': 'border-box'
+    'flex': '3 1 500px', 
+    'backgroundColor': colors['card_bg'], 'padding': '10px', 
+    'borderRadius': '10px', 'minHeight': '400px', 'boxSizing': 'border-box',
+    'overflow': 'hidden' 
+}
+
+# Wrapper: Controls the Flexbox layout (Row on Desktop, Column on Mobile)
+FLEX_WRAPPER_STYLE = {
+    'display': 'flex', 
+    'flexWrap': 'wrap', 
+    'gap': '20px', 
+    'maxWidth': '1400px', 
+    'margin': '0 auto'
 }
 
 def make_control_row(label, id_prefix, min_val, max_val, step, default_val):
@@ -131,7 +148,7 @@ def make_control_row(label, id_prefix, min_val, max_val, step, default_val):
         html.Label(label, style={'color': colors['text'], 'fontWeight': 'bold'}),
         html.Div(style={'display': 'flex', 'alignItems': 'center', 'gap': '15px'}, children=[
             dcc.Input(id=f'{id_prefix}-input', type='number', value=default_val, step=step, 
-                      style={'width': '80px', 'padding': '5px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px'}),
+                      style={'width': '70px', 'padding': '5px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px'}),
             html.Div(style={'flex': '1'}, children=[
                 dcc.Slider(id=f'{id_prefix}-slider', min=min_val, max=max_val, step=step, value=default_val, marks=None, tooltip={"placement": "bottom", "always_visible": True})
             ])
@@ -140,7 +157,7 @@ def make_control_row(label, id_prefix, min_val, max_val, step, default_val):
 
 # --- 1. FUNDAMENTAL TAB LAYOUT ---
 fundamental_layout = html.Div([
-    html.Div(style={'display': 'flex', 'gap': '20px', 'maxWidth': '1400px', 'margin': '20px auto'}, children=[
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
             html.Div([
                 html.H3("Stock Search", style={'color': colors['accent']}),
@@ -153,14 +170,14 @@ fundamental_layout = html.Div([
             ])
         ]),
         html.Div(style=CONTENT_STYLE, children=[
-            dcc.Loading(dcc.Graph(id='fund-price-chart', style={'height': '750px'}), type='circle')
+            dcc.Loading(dcc.Graph(id='fund-price-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
         ])
     ])
 ])
 
 # --- 2. BLACK-SCHOLES TAB LAYOUT ---
 bs_layout = html.Div([
-    html.Div(style={'display': 'flex', 'gap': '20px', 'maxWidth': '1400px', 'margin': '20px auto'}, children=[
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
             html.H3("Option Inputs", style={'color': colors['accent']}),
             make_control_row("Spot Price ($)", "spot", 0, 800, 0.01, initial_spot),
@@ -170,23 +187,23 @@ bs_layout = html.Div([
             make_control_row("Risk-Free Rate (r)", "rate", 0.0, 0.2, 0.001, DEFAULT_RATE),
         ]),
         html.Div(style=CONTENT_STYLE, children=[
-             html.Div(style={'display': 'flex', 'gap': '20px', 'marginBottom': '20px'}, children=[
-                html.Div(style={'flex': 1, 'backgroundColor': colors['card_bg'], 'padding': '15px', 'borderRadius': '8px', 'textAlign': 'center', 'border': f"1px solid {colors['call_text']}"}, children=[
-                    html.H4("Call Price", style={'margin': '0', 'color': colors['call_text']}),
-                    html.H2(id='call-price-display', style={'margin': '10px 0', 'color': colors['text']})
+             html.Div(style={'display': 'flex', 'gap': '10px', 'marginBottom': '20px'}, children=[
+                html.Div(style={'flex': 1, 'backgroundColor': colors['card_bg'], 'padding': '10px', 'borderRadius': '8px', 'textAlign': 'center', 'border': f"1px solid {colors['call_text']}"}, children=[
+                    html.H4("Call Price", style={'margin': '0', 'fontSize': '1rem', 'color': colors['call_text']}),
+                    html.H2(id='call-price-display', style={'margin': '5px 0', 'color': colors['text']})
                 ]),
-                html.Div(style={'flex': 1, 'backgroundColor': colors['card_bg'], 'padding': '15px', 'borderRadius': '8px', 'textAlign': 'center', 'border': f"1px solid {colors['put_text']}"}, children=[
-                    html.H4("Put Price", style={'margin': '0', 'color': colors['put_text']}),
-                    html.H2(id='put-price-display', style={'margin': '10px 0', 'color': colors['text']})
+                html.Div(style={'flex': 1, 'backgroundColor': colors['card_bg'], 'padding': '10px', 'borderRadius': '8px', 'textAlign': 'center', 'border': f"1px solid {colors['put_text']}"}, children=[
+                    html.H4("Put Price", style={'margin': '0', 'fontSize': '1rem', 'color': colors['put_text']}),
+                    html.H2(id='put-price-display', style={'margin': '5px 0', 'color': colors['text']})
                 ]),
             ]),
             html.Div(style={'backgroundColor': colors['card_bg'], 'borderRadius': '10px'}, children=[
                 dcc.Tabs(style={'color': colors['text']}, children=[
-                    dcc.Tab(label='Payoff Diagram', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                        dcc.Graph(id='payoff-graph', style={'height': '600px'})
+                    dcc.Tab(label='Payoff', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                        dcc.Graph(id='payoff-graph', style={'height': '60vh', 'minHeight': '400px'})
                     ]),
-                    dcc.Tab(label='Greeks Analysis', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                        dcc.Graph(id='greeks-graph', style={'height': '600px'})
+                    dcc.Tab(label='Greeks', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                        dcc.Graph(id='greeks-graph', style={'height': '60vh', 'minHeight': '450px'})
                     ]),
                 ])
             ])
@@ -194,30 +211,28 @@ bs_layout = html.Div([
     ])
 ])
 
-# --- 3. SPREAD ANALYSIS TAB LAYOUT (WITH SLIDER) ---
+# --- 3. SPREAD ANALYSIS TAB LAYOUT ---
 PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '2y', 5: '5y', 6: 'max'}
 
 spread_layout = html.Div([
-    html.Div(style={'display': 'flex', 'gap': '20px', 'maxWidth': '1400px', 'margin': '20px auto'}, children=[
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
             html.H3("Spread Inputs", style={'color': colors['accent']}),
             html.Label("Stock A (Numerator)", style={'color': colors['text'], 'fontWeight': 'bold'}),
             dcc.Input(id='spread-ticker-a', type='text', value=DEFAULT_SPREAD_A, placeholder="e.g. KO", 
-                      style={'width': '100%', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px', 'marginBottom': '10px'}),
+                      style={'width': '100%', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px', 'marginBottom': '10px', 'boxSizing': 'border-box'}),
             
             html.Label("Stock B (Denominator)", style={'color': colors['text'], 'fontWeight': 'bold'}),
             dcc.Input(id='spread-ticker-b', type='text', value=DEFAULT_SPREAD_B, placeholder="e.g. PEP", 
-                      style={'width': '100%', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px', 'marginBottom': '20px'}),
+                      style={'width': '100%', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px', 'marginBottom': '20px', 'boxSizing': 'border-box'}),
             
-            # --- SLIDER (TOOLTIP REMOVED) ---
             html.Label("Lookback Period", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block'}),
             html.Div(style={'padding': '0 10px 20px 10px'}, children=[
                 dcc.Slider(
                     id='spread-period-slider',
                     min=0, max=6, step=1,
-                    value=2, # Default to 6mo
+                    value=2,
                     marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: 'MAX'},
-                    # Tooltip property removed here
                 )
             ]),
 
@@ -229,30 +244,34 @@ spread_layout = html.Div([
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Tabs(style={'color': colors['text']}, children=[
-                dcc.Tab(label='Normalized Performance', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                    dcc.Loading(dcc.Graph(id='spread-norm-chart', style={'height': '600px'}), type='circle')
+                dcc.Tab(label='Norm Perf.', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                    dcc.Loading(dcc.Graph(id='spread-norm-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
                 ]),
-                dcc.Tab(label='Spread Ratio (A / B)', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                    dcc.Loading(dcc.Graph(id='spread-ratio-chart', style={'height': '600px'}), type='circle')
+                dcc.Tab(label='Spread Ratio', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                    dcc.Loading(dcc.Graph(id='spread-ratio-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
                 ]),
             ])
         ])
     ])
 ])
 
-app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '20px', 'fontFamily': 'Arial, sans-serif'}, children=[
-    html.H1("Equity Research Dashboard", style={'textAlign': 'center', 'color': colors['text']}),
+# --- APP LAYOUT (With Padding) ---
+app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, children=[
+    html.H1("Equity Research", style={'textAlign': 'center', 'color': colors['text'], 'fontSize': '1.5rem'}),
     
-    dcc.Tabs(id='main-tabs', value='tab-fundamental', style={'marginTop': '20px'}, children=[
-        dcc.Tab(label='Fundamental Analysis', value='tab-fundamental', 
-                style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '15px', 'fontWeight': 'bold'}, 
-                selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '15px'}),
-        dcc.Tab(label='Black-Scholes Model', value='tab-bs', 
-                style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '15px', 'fontWeight': 'bold'}, 
-                selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '15px'}),
-        dcc.Tab(label='Spread Analysis', value='tab-spread', 
-                style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '15px', 'fontWeight': 'bold'}, 
-                selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '15px'}),
+    # Navigation Tabs with Padding
+    dcc.Tabs(id='main-tabs', value='tab-fundamental', 
+             style={'marginTop': '20px', 'marginBottom': '20px'}, 
+             children=[
+                dcc.Tab(label='Fundamentals', value='tab-fundamental', 
+                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
+                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Black-Scholes', value='tab-bs', 
+                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
+                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Spread', value='tab-spread', 
+                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
+                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
     
     html.Div(id='fund-content-wrapper', children=fundamental_layout, style={'display': 'block'}),
@@ -263,7 +282,6 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 # -----------------------------------------------------------------------------
 # 4. CALLBACKS
 # -----------------------------------------------------------------------------
-
 # Tab Visibility Toggle
 @app.callback(
     [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'), Output('spread-content-wrapper', 'style')],
@@ -311,7 +329,7 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
         
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Close', line=dict(color=colors['accent'])))
-        fig.update_layout(title=f"{ticker_symbol} - 6 Month History", yaxis_title="Price ($)", **layout_settings)
+        fig.update_layout(title=f"{ticker_symbol} - 6 Month History", yaxis_title="Price ($)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
         
         if not hist.empty:
             current_price = round(hist['Close'].iloc[-1], 2)
@@ -323,7 +341,7 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
         err = html.Div(f"Error: {e}", style={'color': 'red'})
         return err, go.Figure(layout=layout_settings), no_update, no_update, no_update, no_update
 
-# --- SPREAD ANALYSIS CALLBACK (WITH SLIDER) ---
+# --- SPREAD ANALYSIS CALLBACK ---
 @app.callback(
     [Output('spread-norm-chart', 'figure'), Output('spread-ratio-chart', 'figure'), Output('spread-stats-display', 'children')],
     [Input('spread-analyze-btn', 'n_clicks')],
@@ -333,11 +351,9 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
     if not ticker_a or not ticker_b:
         return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div()
     
-    # Map slider index to period string
     selected_period = PERIOD_MAP.get(slider_val, '6mo')
     
     try:
-        # Fetch Data with Dynamic Period
         df_a = yf.Ticker(ticker_a).history(period=selected_period)['Close']
         df_b = yf.Ticker(ticker_b).history(period=selected_period)['Close']
         df = pd.DataFrame({ticker_a: df_a, ticker_b: df_b}).dropna()
@@ -345,23 +361,20 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
         if df.empty:
             return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div("No overlapping data found.")
 
-        # 1. Normalized Chart (Base=100)
         norm_a = (df[ticker_a] / df[ticker_a].iloc[0]) * 100
         norm_b = (df[ticker_b] / df[ticker_b].iloc[0]) * 100
         
         fig_norm = go.Figure()
         fig_norm.add_trace(go.Scatter(x=df.index, y=norm_a, mode='lines', name=f"{ticker_a} (Norm)", line=dict(color=colors['accent'])))
         fig_norm.add_trace(go.Scatter(x=df.index, y=norm_b, mode='lines', name=f"{ticker_b} (Norm)", line=dict(color=colors['put_text'])))
-        fig_norm.update_layout(title=f"Relative Performance (Base=100) - {selected_period.upper()}", yaxis_title="Normalized Price", **layout_settings)
+        fig_norm.update_layout(title=f"Relative Perf. - {selected_period.upper()}", yaxis_title="Norm Price", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
         
-        # 2. Ratio Chart (A / B)
         ratio = df[ticker_a] / df[ticker_b]
         fig_ratio = go.Figure()
         fig_ratio.add_trace(go.Scatter(x=df.index, y=ratio, mode='lines', name='Ratio', line=dict(color=colors['success'])))
         fig_ratio.add_hline(y=ratio.mean(), line_dash="dash", line_color="white", annotation_text="Mean")
-        fig_ratio.update_layout(title=f"Price Ratio ({ticker_a} / {ticker_b})", yaxis_title="Ratio", **layout_settings)
+        fig_ratio.update_layout(title=f"Ratio ({ticker_a} / {ticker_b})", yaxis_title="Ratio", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
         
-        # 3. Stats
         corr = df[ticker_a].corr(df[ticker_b])
         curr_ratio = ratio.iloc[-1]
         
