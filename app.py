@@ -263,7 +263,6 @@ vol_surface_layout = html.Div([
             dcc.Input(id='vol-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY", 
                       style={'width': '100%', 'boxSizing': 'border-box', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px'}),
             
-            # --- NEW TOGGLE SWITCH ---
             html.Label("Plot Type", style={'color': colors['text'], 'fontWeight': 'bold', 'marginTop': '15px', 'display': 'block'}),
             dcc.RadioItems(
                 id='vol-plot-type',
@@ -480,13 +479,17 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
         if len(strikes) < 5:
             return go.Figure(layout=layout_settings), html.Div("Not enough liquid options data to plot.", style={'color': colors['danger']})
 
+        # --- DYNAMIC RANGE CALCULATIONS ---
+        min_strike, max_strike = min(strikes), max(strikes)
+        min_dte, max_dte = min(dtes), max(dtes)
+
         fig = go.Figure()
 
         # --- DYNAMIC PLOTTING LOGIC ---
         if plot_type == 'surface':
             # Interpolation to create the 2D meshgrid for go.Surface
-            strike_grid = np.linspace(min(strikes), max(strikes), 40)
-            dte_grid = np.linspace(min(dtes), max(dtes), 40)
+            strike_grid = np.linspace(min_strike, max_strike, 40)
+            dte_grid = np.linspace(min_dte, max_dte, 40)
             X, Y = np.meshgrid(strike_grid, dte_grid)
             
             Z = griddata((strikes, dtes), ivs, (X, Y), method='cubic')
@@ -514,12 +517,34 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
         fig.update_layout(
             title=f"{ticker_symbol} Call Implied Volatility ({plot_type.title()})",
             scene=dict(
+                # --- NEW: Custom Default Camera Angle ---
+                camera=dict(
+                    up=dict(x=0, y=0, z=1),
+                    center=dict(x=0, y=0, z=0),
+                    eye=dict(x=-1.8, y=-1.2, z=0.8) # Adjusted for a clear view of ascending strikes
+                ),
                 xaxis_title='Strike Price ($)',
                 yaxis_title='Days to Expiration (DTE)',
                 zaxis_title='Implied Volatility',
-                xaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True),
-                yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True),
-                zaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True)
+                
+                # --- NEW: Dynamic ascending ranges ---
+                xaxis=dict(
+                    backgroundcolor=colors['card_bg'], 
+                    gridcolor="#555", 
+                    showbackground=True, 
+                    range=[min_strike, max_strike]
+                ),
+                yaxis=dict(
+                    backgroundcolor=colors['card_bg'], 
+                    gridcolor="#555", 
+                    showbackground=True, 
+                    range=[min_dte, max_dte]
+                ),
+                zaxis=dict(
+                    backgroundcolor=colors['card_bg'], 
+                    gridcolor="#555", 
+                    showbackground=True
+                )
             ),
             margin=dict(l=0, r=0, t=40, b=0),
             **layout_settings
