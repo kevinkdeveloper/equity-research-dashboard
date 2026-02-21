@@ -4,8 +4,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.stats import norm
+from scipy.interpolate import griddata
 import yfinance as yf
 import pandas as pd
+import datetime
 
 # -----------------------------------------------------------------------------
 # 1. SETTINGS & DEFAULTS
@@ -31,7 +33,7 @@ layout_settings = dict(
     plot_bgcolor=colors['card_bg'],
     font=dict(color=colors['text']),
     hovermode="x unified",
-    autosize=True  # Important for mobile responsiveness
+    autosize=True  
 )
 
 # -----------------------------------------------------------------------------
@@ -94,7 +96,6 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_spot.add_trace(go.Scatter(x=spot_range, y=put_prices, mode='lines', name='Put Value', line=dict(color=colors['put_text'])))
     fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#888", annotation_text="Spot")
     
-    # Reduced margins for mobile
     fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)', 
                            margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
     
@@ -117,7 +118,6 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, title='Equity Resea
                 meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
 
-# Sidebar: Flexible width, minimum 350px, stacks on small screens
 SIDEBAR_STYLE = {
     'flex': '1 1 350px', 
     'backgroundColor': colors['card_bg'], 'padding': '20px',
@@ -126,7 +126,6 @@ SIDEBAR_STYLE = {
     'marginBottom': '20px'
 }
 
-# Content: Flexible width, takes remaining space or stacks
 CONTENT_STYLE = {
     'flex': '3 1 500px', 
     'backgroundColor': colors['card_bg'], 'padding': '10px', 
@@ -134,7 +133,6 @@ CONTENT_STYLE = {
     'overflow': 'hidden' 
 }
 
-# Wrapper: Controls the Flexbox layout (Row on Desktop, Column on Mobile)
 FLEX_WRAPPER_STYLE = {
     'display': 'flex', 
     'flexWrap': 'wrap', 
@@ -255,6 +253,40 @@ spread_layout = html.Div([
     ])
 ])
 
+# --- 4. VOLATILITY SURFACE TAB LAYOUT ---
+vol_surface_layout = html.Div([
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
+        html.Div(style=SIDEBAR_STYLE, children=[
+            html.H3("Vol Surface Inputs", style={'color': colors['accent']}),
+            html.P("Generates a 3D Implied Volatility Surface using current Options Chain data.", style={'color': colors['text'], 'fontSize': '0.9em'}),
+            
+            dcc.Input(id='vol-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY", 
+                      style={'width': '100%', 'boxSizing': 'border-box', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px'}),
+            
+            # --- NEW TOGGLE SWITCH ---
+            html.Label("Plot Type", style={'color': colors['text'], 'fontWeight': 'bold', 'marginTop': '15px', 'display': 'block'}),
+            dcc.RadioItems(
+                id='vol-plot-type',
+                options=[
+                    {'label': ' Surface (Interpolated)', 'value': 'surface'},
+                    {'label': ' Scatter (Raw Data)', 'value': 'scatter'}
+                ],
+                value='surface',  # Default selection
+                labelStyle={'display': 'block', 'color': colors['text'], 'marginBottom': '5px', 'cursor': 'pointer'},
+                style={'marginBottom': '10px'}
+            ),
+            
+            html.Button('Fetch Options Data', id='vol-submit-btn', n_clicks=0, 
+                        style={'marginTop': '10px', 'width': '100%', 'boxSizing': 'border-box', 'padding': '10px', 'backgroundColor': colors['accent'], 'border': 'none', 'borderRadius': '4px', 'fontWeight': 'bold', 'cursor': 'pointer'}),
+            html.Hr(style={'borderColor': '#555'}),
+            html.Div(id='vol-info-display')
+        ]),
+        html.Div(style=CONTENT_STYLE, children=[
+            dcc.Loading(dcc.Graph(id='vol-surface-chart', style={'height': '70vh', 'minHeight': '500px'}), type='circle')
+        ])
+    ])
+])
+
 # --- APP LAYOUT (With Padding) ---
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, children=[
     html.H1("Equity Research", style={'textAlign': 'center', 'color': colors['text'], 'fontSize': '1.5rem'}),
@@ -272,28 +304,34 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Spread', value='tab-spread', 
                         style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
                         selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Vol Surface', value='tab-vol', 
+                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
+                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
     
     html.Div(id='fund-content-wrapper', children=fundamental_layout, style={'display': 'block'}),
     html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
-    html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'})
+    html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
+    html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'})
 ])
 
 # -----------------------------------------------------------------------------
-# 4. CALLBACKS
+# 5. CALLBACKS
 # -----------------------------------------------------------------------------
+
 # Tab Visibility Toggle
 @app.callback(
-    [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'), Output('spread-content-wrapper', 'style')],
+    [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'), 
+     Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    if tab_value == 'tab-fundamental':
-        return {'display': 'block'}, {'display': 'none'}, {'display': 'none'}
-    elif tab_value == 'tab-bs':
-        return {'display': 'none'}, {'display': 'block'}, {'display': 'none'}
-    else:
-        return {'display': 'none'}, {'display': 'none'}, {'display': 'block'}
+    fund_style, bs_style, spread_style, vol_style = [{'display': 'none'}] * 4
+    if tab_value == 'tab-fundamental': fund_style = {'display': 'block'}
+    elif tab_value == 'tab-bs': bs_style = {'display': 'block'}
+    elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
+    elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
+    return fund_style, bs_style, spread_style, vol_style
 
 # Main Fundamental Analysis Callback
 @app.callback(
@@ -391,6 +429,111 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
     except Exception as e:
         return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div(f"Error: {e}", style={'color': 'red'})
 
+# --- VOLATILITY SURFACE CALLBACK ---
+@app.callback(
+    [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children')],
+    [Input('vol-submit-btn', 'n_clicks'), Input('vol-plot-type', 'value')], 
+    [State('vol-ticker-input', 'value')]
+)
+def update_vol_surface(n_clicks, plot_type, ticker_symbol):
+    if not ticker_symbol:
+        return go.Figure(layout=layout_settings), html.Div()
+    
+    ticker_symbol = ticker_symbol.upper().strip()
+    
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        expirations = ticker.options
+        
+        if not expirations:
+            return go.Figure(layout=layout_settings), html.Div("No options data available.", style={'color': colors['danger']})
+
+        # To prevent API timeouts, limit to the first 8 expirations
+        expirations = list(expirations)[:8]
+        
+        hist = ticker.history(period="1d")
+        if hist.empty:
+            return go.Figure(layout=layout_settings), html.Div("Could not fetch underlying price.", style={'color': colors['danger']})
+        
+        spot_price = hist['Close'].iloc[-1]
+        
+        strikes, dtes, ivs = [], [], []
+        today = datetime.datetime.now().replace(tzinfo=None)
+        
+        for exp in expirations:
+            exp_date = datetime.datetime.strptime(exp, "%Y-%m-%d")
+            dte = (exp_date - today).days
+            if dte <= 0: dte = 0.5 
+            
+            chain = ticker.option_chain(exp)
+            calls = chain.calls
+            
+            # Filter out extreme deep in/out of money and illiquid strikes
+            calls = calls[(calls['strike'] >= spot_price * 0.7) & (calls['strike'] <= spot_price * 1.3)]
+            calls = calls[(calls['impliedVolatility'] > 0.01) & (calls['volume'] > 0)]
+            
+            for _, row in calls.iterrows():
+                strikes.append(row['strike'])
+                dtes.append(dte)
+                ivs.append(row['impliedVolatility'])
+                
+        if len(strikes) < 5:
+            return go.Figure(layout=layout_settings), html.Div("Not enough liquid options data to plot.", style={'color': colors['danger']})
+
+        fig = go.Figure()
+
+        # --- DYNAMIC PLOTTING LOGIC ---
+        if plot_type == 'surface':
+            # Interpolation to create the 2D meshgrid for go.Surface
+            strike_grid = np.linspace(min(strikes), max(strikes), 40)
+            dte_grid = np.linspace(min(dtes), max(dtes), 40)
+            X, Y = np.meshgrid(strike_grid, dte_grid)
+            
+            Z = griddata((strikes, dtes), ivs, (X, Y), method='cubic')
+            if np.isnan(Z).all():
+                 Z = griddata((strikes, dtes), ivs, (X, Y), method='linear')
+
+            fig.add_trace(go.Surface(z=Z, x=X, y=Y, colorscale='Viridis', colorbar=dict(title="IV")))
+        
+        else: # plot_type == 'scatter'
+            # Plot the raw un-interpolated data
+            fig.add_trace(go.Scatter3d(
+                x=strikes, y=dtes, z=ivs,
+                mode='markers',
+                marker=dict(
+                    size=4,
+                    color=ivs,                
+                    colorscale='Viridis',
+                    opacity=0.8,
+                    colorbar=dict(title="IV")
+                ),
+                name='Raw IV'
+            ))
+        
+        # Standardize layout for both chart types
+        fig.update_layout(
+            title=f"{ticker_symbol} Call Implied Volatility ({plot_type.title()})",
+            scene=dict(
+                xaxis_title='Strike Price ($)',
+                yaxis_title='Days to Expiration (DTE)',
+                zaxis_title='Implied Volatility',
+                xaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True),
+                yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True),
+                zaxis=dict(backgroundcolor=colors['card_bg'], gridcolor="#555", showbackground=True)
+            ),
+            margin=dict(l=0, r=0, t=40, b=0),
+            **layout_settings
+        )
+        
+        info_html = html.Div([
+            html.P(f"Data points: {len(strikes)}", style={'color': colors['text']}),
+            html.P(f"Spot Reference: ${spot_price:.2f}", style={'color': colors['text']})
+        ])
+        
+        return fig, info_html
+
+    except Exception as e:
+        return go.Figure(layout=layout_settings), html.Div(f"Error: {e}", style={'color': 'red'})
 
 # --- BLACK-SCHOLES SYNC ---
 def sync_input(slider_val, input_val):
