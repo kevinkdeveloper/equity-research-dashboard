@@ -521,7 +521,7 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
                 camera=dict(
                     up=dict(x=0, y=0, z=1),
                     center=dict(x=0, y=0, z=0),
-                    eye=dict(x=-1.8, y=-1.2, z=0.8) # Adjusted for a clear view of ascending strikes
+                    eye=dict(x=-1.8, y=-1.2, z=1.0) # Adjusted for a clear view of ascending strikes
                 ),
                 xaxis_title='Strike Price ($)',
                 yaxis_title='Days to Expiration (DTE)',
