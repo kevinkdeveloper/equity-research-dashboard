@@ -270,7 +270,7 @@ vol_surface_layout = html.Div([
                     {'label': ' Surface (Interpolated)', 'value': 'surface'},
                     {'label': ' Scatter (Raw Data)', 'value': 'scatter'}
                 ],
-                value='surface',  # Default selection
+                value='surface',
                 labelStyle={'display': 'block', 'color': colors['text'], 'marginBottom': '5px', 'cursor': 'pointer'},
                 style={'marginBottom': '10px'}
             ),
@@ -286,9 +286,37 @@ vol_surface_layout = html.Div([
     ])
 ])
 
+# --- 5. VOLATILITY ANALYTICS TAB LAYOUT ---
+vol_analytics_layout = html.Div([
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
+        html.Div(style=SIDEBAR_STYLE, children=[
+            html.H3("Vol Analytics", style={'color': colors['accent']}),
+            html.P("Compare Realized Volatility (HV) against Implied Volatility (IV) and track live skew.", style={'color': colors['text'], 'fontSize': '0.9em'}),
+            
+            html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold'}),
+            dcc.Input(id='va-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY", 
+                      style={'width': '100%', 'boxSizing': 'border-box', 'padding': '10px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '4px', 'marginBottom': '15px'}),
+            
+            html.Label("HV Lookback Window (Days)", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block'}),
+            dcc.Slider(id='va-window-slider', min=10, max=90, step=10, value=30, marks={10: '10d', 30: '30d', 60: '60d', 90: '90d'}),
+            
+            html.Button('Analyze Volatility', id='va-submit-btn', n_clicks=0, 
+                        style={'marginTop': '20px', 'width': '100%', 'boxSizing': 'border-box', 'padding': '10px', 'backgroundColor': colors['accent'], 'border': 'none', 'borderRadius': '4px', 'fontWeight': 'bold', 'cursor': 'pointer'}),
+            html.Hr(style={'borderColor': '#555', 'marginTop': '20px'}),
+            
+            html.Div(id='va-stats-display')
+        ]),
+        html.Div(style=CONTENT_STYLE, children=[
+            dcc.Loading(dcc.Graph(id='va-hv-chart', style={'height': '45vh', 'minHeight': '300px'}), type='circle'),
+            dcc.Loading(dcc.Graph(id='va-skew-chart', style={'height': '35vh', 'minHeight': '250px', 'marginTop': '10px'}), type='circle')
+        ])
+    ])
+])
+
+
 # --- APP LAYOUT (With Padding) ---
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px', 'fontFamily': 'Arial, sans-serif'}, children=[
-    html.H1("Equity Research", style={'textAlign': 'center', 'color': colors['text'], 'fontSize': '1.5rem'}),
+    html.H1("Equity Research Dashboard", style={'textAlign': 'center', 'color': colors['text'], 'fontSize': '1.5rem'}),
     
     # Navigation Tabs with Padding
     dcc.Tabs(id='main-tabs', value='tab-fundamental', 
@@ -306,12 +334,16 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Vol Surface', value='tab-vol', 
                         style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
                         selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Vol Analytics', value='tab-va', 
+                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'}, 
+                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
     
     html.Div(id='fund-content-wrapper', children=fundamental_layout, style={'display': 'block'}),
     html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
-    html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'})
+    html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
+    html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'})
 ])
 
 # -----------------------------------------------------------------------------
@@ -321,16 +353,18 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 # Tab Visibility Toggle
 @app.callback(
     [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'), 
-     Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style')],
+     Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style'),
+     Output('va-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    fund_style, bs_style, spread_style, vol_style = [{'display': 'none'}] * 4
+    fund_style, bs_style, spread_style, vol_style, va_style = [{'display': 'none'}] * 5
     if tab_value == 'tab-fundamental': fund_style = {'display': 'block'}
     elif tab_value == 'tab-bs': bs_style = {'display': 'block'}
     elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
     elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
-    return fund_style, bs_style, spread_style, vol_style
+    elif tab_value == 'tab-va': va_style = {'display': 'block'}
+    return fund_style, bs_style, spread_style, vol_style, va_style
 
 # Main Fundamental Analysis Callback
 @app.callback(
@@ -496,7 +530,7 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
             if np.isnan(Z).all():
                  Z = griddata((strikes, dtes), ivs, (X, Y), method='linear')
 
-            fig.add_trace(go.Surface(z=Z, x=X, y=Y, colorscale='Viridis', colorbar=dict(title="IV")))
+            fig.add_trace(go.Surface(z=Z, x=X, y=Y, colorscale='Jet', colorbar=dict(title="IV")))
         
         else: # plot_type == 'scatter'
             # Plot the raw un-interpolated data
@@ -506,7 +540,7 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
                 marker=dict(
                     size=4,
                     color=ivs,                
-                    colorscale='Viridis',
+                    colorscale='Jet',
                     opacity=0.8,
                     colorbar=dict(title="IV")
                 ),
@@ -559,6 +593,128 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
 
     except Exception as e:
         return go.Figure(layout=layout_settings), html.Div(f"Error: {e}", style={'color': 'red'})
+
+# --- VOLATILITY ANALYTICS CALLBACK ---
+@app.callback(
+    [Output('va-hv-chart', 'figure'), Output('va-skew-chart', 'figure'), Output('va-stats-display', 'children')],
+    [Input('va-submit-btn', 'n_clicks')],
+    [State('va-ticker-input', 'value'), State('va-window-slider', 'value')]
+)
+def update_vol_analytics(n_clicks, ticker_symbol, window):
+    if not ticker_symbol:
+        return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div()
+    
+    ticker_symbol = ticker_symbol.upper().strip()
+    
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        
+        # 1. Fetch 1 year of historical data
+        hist = ticker.history(period="1y")
+        if hist.empty or len(hist) < window:
+            return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div(f"Not enough historical data for {ticker_symbol}.", style={'color': colors['danger']})
+        
+        # 2. Calculate Realized Historical Volatility (HV)
+        hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
+        hist['HV'] = hist['Log_Ret'].rolling(window=window).std() * np.sqrt(252) * 100 
+        hist = hist.dropna()
+        
+        current_hv = hist['HV'].iloc[-1]
+        hv_min = hist['HV'].min()
+        hv_max = hist['HV'].max()
+        rvr = ((current_hv - hv_min) / (hv_max - hv_min)) * 100
+        
+        # 3. Fetch Options for Live Skew Tracker
+        options = ticker.options
+        current_iv = None
+        fig_skew = go.Figure()
+        skew_ratio_text = "N/A"
+        
+        if options:
+            today = datetime.datetime.now().date()
+            valid_expiries = [exp for exp in options if (datetime.datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 7]
+            target_exp = valid_expiries[0] if valid_expiries else options[0]
+            
+            chain = ticker.option_chain(target_exp)
+            calls = chain.calls
+            puts = chain.puts
+            spot_price = hist['Close'].iloc[-1]
+            
+            # Find the ATM strike
+            atm_call = calls.iloc[(calls['strike'] - spot_price).abs().argsort()[:1]]
+            if not atm_call.empty:
+                current_iv = atm_call['impliedVolatility'].values[0] * 100
+            
+            # Filter Skew Data for liquidity and range (+/- 20% of spot)
+            lower_bound, upper_bound = spot_price * 0.8, spot_price * 1.2
+            calls_skew = calls[(calls['strike'] >= lower_bound) & (calls['strike'] <= upper_bound) & (calls['volume'] > 0)]
+            puts_skew = puts[(puts['strike'] >= lower_bound) & (puts['strike'] <= upper_bound) & (puts['volume'] > 0)]
+            
+            # Plot the Skew Smirk
+            fig_skew.add_trace(go.Scatter(x=puts_skew['strike'], y=puts_skew['impliedVolatility']*100, mode='lines+markers', name='Puts IV', line=dict(color=colors['put_text'])))
+            fig_skew.add_trace(go.Scatter(x=calls_skew['strike'], y=calls_skew['impliedVolatility']*100, mode='lines+markers', name='Calls IV', line=dict(color=colors['call_text'])))
+            fig_skew.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="#888", annotation_text="Spot")
+            
+            fig_skew.update_layout(title=f"Live Volatility Skew (Expiry: {target_exp})", xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility (%)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+            
+            # Calculate a quick Skew Ratio (10% OTM Put IV / ATM Call IV)
+            otm_put_target = spot_price * 0.90
+            closest_put = puts.iloc[(puts['strike'] - otm_put_target).abs().argsort()[:1]]
+            if not closest_put.empty and current_iv:
+                otm_put_iv = closest_put['impliedVolatility'].values[0] * 100
+                skew_ratio = otm_put_iv / current_iv
+                skew_ratio_text = f"{skew_ratio:.2f}x"
+                
+        else:
+            fig_skew.update_layout(title="No Options Data Available for Skew", **layout_settings)
+
+        # 4. Create the HV Chart
+        fig_hv = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1, 
+                            row_heights=[0.6, 0.4], subplot_titles=(f"{ticker_symbol} Price", f"{window}-Day Rolling Historical Volatility (HV)"))
+        fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Price', line=dict(color=colors['accent'])), row=1, col=1)
+        fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['HV'], mode='lines', name=f'{window}d HV', line=dict(color=colors['put_text'])), row=2, col=1)
+        
+        fig_hv.update_layout(margin=dict(l=20, r=20, t=40, b=20), showlegend=False, **layout_settings)
+        fig_hv.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig_hv.update_yaxes(title_text="Volatility (%)", row=2, col=1)
+        
+        # 5. Build the Statistics UI
+        vrp_text = "N/A"
+        vrp_color = colors['text']
+        if current_iv:
+            vrp = current_iv - current_hv
+            vrp_text = f"{vrp:+.2f}%"
+            vrp_color = colors['success'] if vrp > 0 else colors['danger']
+            
+        stats_html = html.Div([
+            html.H4("Current Volatility Metrics", style={'color': colors['text'], 'marginBottom': '10px'}),
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginBottom': '5px'}, children=[
+                html.Span("Realized HV:", style={'color': '#aaa'}),
+                html.Span(f"{current_hv:.2f}%", style={'fontWeight': 'bold', 'color': colors['text']})
+            ]),
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginBottom': '5px'}, children=[
+                html.Span("ATM Implied Vol (IV):", style={'color': '#aaa'}),
+                html.Span(f"{current_iv:.2f}%" if current_iv else "N/A", style={'fontWeight': 'bold', 'color': colors['accent']})
+            ]),
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginBottom': '15px'}, children=[
+                html.Span("Vol Risk Premium (IV - HV):", style={'color': '#aaa'}),
+                html.Span(vrp_text, style={'fontWeight': 'bold', 'color': vrp_color})
+            ]),
+            html.Hr(style={'borderColor': '#555', 'marginBottom': '15px'}),
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginBottom': '5px'}, children=[
+                html.Span("10% OTM Put Skew Ratio:", style={'color': '#aaa', 'fontWeight': 'bold'}),
+                html.Span(skew_ratio_text, style={'color': colors['text']})
+            ]),
+            html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginTop': '10px'}, children=[
+                html.Span("HV Rank (HVR):", style={'color': '#aaa', 'fontWeight': 'bold'}),
+                html.Span(f"{rvr:.1f}", style={'fontWeight': 'bold', 'color': colors['call_text'] if rvr < 50 else colors['put_text']})
+            ])
+        ])
+        
+        return fig_hv, fig_skew, stats_html
+        
+    except Exception as e:
+        return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div(f"Error: {e}", style={'color': colors['danger']})
 
 # --- BLACK-SCHOLES SYNC ---
 def sync_input(slider_val, input_val):
