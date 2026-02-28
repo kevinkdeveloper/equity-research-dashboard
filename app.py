@@ -22,6 +22,20 @@ DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
 DEFAULT_SCANNER_TICKERS = "SPY, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL, GLD, SLV"
 
+SECTOR_PEERS = {
+    'Technology':             ['MSFT', 'AAPL', 'NVDA', 'GOOGL', 'META', 'AMD', 'INTC', 'CRM', 'ADBE', 'ORCL'],
+    'Consumer Cyclical':      ['AMZN', 'TSLA', 'HD', 'MCD', 'NKE', 'SBUX', 'TGT', 'LOW', 'BKNG', 'ABNB'],
+    'Financial Services':     ['JPM', 'BAC', 'GS', 'MS', 'WFC', 'BLK', 'C', 'AXP', 'V', 'MA'],
+    'Healthcare':             ['UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'TMO', 'ABT', 'BMY', 'AMGN', 'LLY'],
+    'Communication Services': ['GOOGL', 'META', 'NFLX', 'DIS', 'VZ', 'T', 'CMCSA', 'SNAP'],
+    'Industrials':            ['HON', 'UPS', 'CAT', 'BA', 'GE', 'LMT', 'RTX', 'DE', 'EMR', 'MMM'],
+    'Consumer Defensive':     ['PG', 'KO', 'PEP', 'WMT', 'COST', 'PM', 'CL', 'GIS', 'MO'],
+    'Energy':                 ['XOM', 'CVX', 'COP', 'SLB', 'EOG', 'MPC', 'VLO', 'OXY', 'PSX'],
+    'Utilities':              ['NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'XEL', 'ES', 'ED'],
+    'Real Estate':            ['AMT', 'PLD', 'CCI', 'EQIX', 'PSA', 'O', 'WELL', 'SPG', 'AVB'],
+    'Basic Materials':        ['LIN', 'APD', 'ECL', 'NEM', 'FCX', 'ALB', 'NUE', 'CF', 'DD'],
+}
+
 colors = {
     'background': '#000000', 'text': '#ffffff', 'card_bg': '#0d0d0d',
     'input_bg': '#1a1a1a', 'call_text': '#00c800', 'put_text': '#ff3300',
@@ -165,6 +179,84 @@ def generate_vol_signals(current_iv, current_hv, rvr, skew_ratio, term_slope):
         else:
             signals.append({'label': 'Term Struct', 'signal': 'Normal Curve', 'detail': 'Balanced term structure', 'badge': 'badge-green'})
     return signals
+
+
+def compute_dcf(ticker_symbol, growth_pct, wacc_pct, terminal_pct):
+    """5-year DCF model. Returns result dict or None on failure."""
+    try:
+        t = yf.Ticker(ticker_symbol)
+        info = t.info
+        fcf = info.get('freeCashflow')
+        if not fcf:
+            cf = t.cashflow
+            if cf is not None and not cf.empty:
+                for row in ['Free Cash Flow', 'Operating Cash Flow']:
+                    if row in cf.index:
+                        fcf = cf.loc[row].iloc[0]
+                        break
+        if not fcf or fcf <= 0:
+            return None
+
+        shares = info.get('sharesOutstanding') or 1
+        cash   = info.get('totalCash',  0) or 0
+        debt   = info.get('totalDebt',  0) or 0
+        price  = info.get('currentPrice') or info.get('regularMarketPrice')
+
+        g  = growth_pct   / 100
+        r  = wacc_pct     / 100
+        tg = terminal_pct / 100
+        if r <= tg:
+            return None  # model breaks if WACC ≤ terminal growth
+
+        proj = [fcf * (1 + g) ** yr for yr in range(1, 6)]
+        pv   = [f / (1 + r) ** yr   for yr, f in enumerate(proj, 1)]
+        tv   = proj[-1] * (1 + tg) / (r - tg)
+        pv_tv = tv / (1 + r) ** 5
+
+        ev          = sum(pv) + pv_tv
+        equity_val  = ev + cash - debt
+        intrinsic   = equity_val / shares
+
+        return {
+            'fcf': fcf, 'proj': proj, 'pv': pv,
+            'tv': tv, 'pv_tv': pv_tv, 'ev': ev,
+            'equity_val': equity_val, 'intrinsic': intrinsic,
+            'price': price, 'cash': cash, 'debt': debt,
+        }
+    except:
+        return None
+
+
+def get_comp_row(sym):
+    """Fetch key valuation + margin metrics for one ticker."""
+    try:
+        info = yf.Ticker(sym).info
+        mc = info.get('marketCap')
+        mc_str = (f"${mc/1e12:.2f}T" if mc and mc >= 1e12
+                  else f"${mc/1e9:.1f}B"  if mc and mc >= 1e9
+                  else f"${mc/1e6:.0f}M"  if mc
+                  else 'N/A')
+
+        def _f(v, pct=False):
+            if v is None: return 'N/A'
+            return f"{v*100:.1f}%" if pct else f"{v:.1f}"
+
+        price = info.get('currentPrice') or info.get('regularMarketPrice')
+        return {
+            'Ticker':    sym,
+            'Price':     f"${price:.2f}" if price else 'N/A',
+            'Mkt Cap':   mc_str,
+            'P/E':       _f(info.get('trailingPE')),
+            'Fwd P/E':   _f(info.get('forwardPE')),
+            'EV/EBITDA': _f(info.get('enterpriseToEbitda')),
+            'P/S':       _f(info.get('priceToSalesTrailingTwelveMonths')),
+            'P/B':       _f(info.get('priceToBook')),
+            'Rev Gr':    _f(info.get('revenueGrowth'), pct=True),
+            'Op Mgn':    _f(info.get('operatingMargins'), pct=True),
+            'ROE':       _f(info.get('returnOnEquity'), pct=True),
+        }
+    except:
+        return None
 
 
 def scan_ticker(ticker_symbol):
@@ -341,28 +433,80 @@ def make_empty_chart(message="Enter a ticker and click Analyze to get started.")
 
 
 # --- 1. FUNDAMENTAL TAB LAYOUT ---
-# CHANGE: Added placeholder text and better empty-state guidance
 fundamental_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
-            html.Div([
-                html.H3("Stock Search", style={'color': colors['accent'], 'marginBottom': '4px'}),
-                # CHANGE: Added description so users know what this tab does
-                html.P("Look up any ticker to view fundamentals and price history.", className='helper-text', style={'marginTop': '0'}),
-                dcc.Input(id='fund-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="Enter ticker (e.g. AAPL, MSFT, TSLA)",
-                          style=INPUT_STYLE),
-                html.Button('Analyze', id='fund-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '10px'}),
-                html.Hr(className='section-divider'),
-                html.Div(id='fund-info-display',
-                    # CHANGE: Default empty-state content so sidebar isn't blank on load
-                    children=html.Div([
-                        html.P("Company info will appear here after search.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-                    ])
-                )
-            ])
+            html.H3("Stock Search", style={'color': colors['accent'], 'marginBottom': '4px'}),
+            html.P("Look up any ticker to view fundamentals, DCF valuation, and sector comparables.",
+                   className='helper-text', style={'marginTop': '0'}),
+
+            dcc.Input(id='fund-ticker-input', type='text', value=DEFAULT_TICKER,
+                      placeholder="Enter ticker (e.g. AAPL, MSFT, TSLA)", style=INPUT_STYLE),
+
+            html.Label("Lookback Period", style={'color': colors['text'], 'fontWeight': 'bold',
+                       'marginBottom': '10px', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '16px'}),
+            html.Div(style={'padding': '0 10px 20px 10px'}, children=[
+                dcc.Slider(id='fund-period-slider', min=0, max=6, step=1, value=2,
+                           marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: 'MAX'})
+            ]),
+
+            html.Hr(className='section-divider'),
+            html.Label("DCF Assumptions", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("5-year FCF projection. Adjust growth, discount rate & terminal growth.",
+                     className='helper-text'),
+            html.Div(style={'display': 'grid', 'gridTemplateColumns': 'repeat(3, 1fr)', 'gap': '8px', 'marginBottom': '14px'}, children=[
+                html.Div([
+                    html.Div("Growth %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
+                    dcc.Input(id='fund-dcf-growth', type='number', value=10, min=0, max=50, step=0.5,
+                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
+                ]),
+                html.Div([
+                    html.Div("WACC %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
+                    dcc.Input(id='fund-dcf-wacc', type='number', value=10, min=1, max=30, step=0.5,
+                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
+                ]),
+                html.Div([
+                    html.Div("Term G %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
+                    dcc.Input(id='fund-dcf-terminal', type='number', value=2.5, min=0, max=5, step=0.5,
+                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
+                ]),
+            ]),
+
+            html.Button('Analyze', id='fund-submit-btn', n_clicks=0, style=BUTTON_STYLE),
+            html.Hr(className='section-divider'),
+            html.Div(id='fund-info-display', children=html.Div([
+                html.P("Company info will appear here after search.",
+                       style={'color': colors['muted'], 'fontStyle': 'italic'})
+            ]))
         ]),
+
         html.Div(style=CONTENT_STYLE, children=[
-            dcc.Loading(dcc.Graph(id='fund-price-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
+            dcc.Tabs(value='tab-fund-price',
+                     style={'marginBottom': '10px'},
+                     children=[
+                dcc.Tab(label='Price Chart', value='tab-fund-price',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
+                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
+                        children=[
+                            dcc.Loading(dcc.Graph(id='fund-price-chart',
+                                                  style={'height': '58vh', 'minHeight': '380px'}), type='circle')
+                        ]),
+                dcc.Tab(label='DCF Model', value='tab-fund-dcf',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
+                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
+                        children=[
+                            dcc.Loading(html.Div(id='fund-dcf-display', style={'padding': '12px'}), type='circle')
+                        ]),
+                dcc.Tab(label='Comparables', value='tab-fund-comps',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
+                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
+                        children=[
+                            dcc.Loading(html.Div(id='fund-comps-display', style={'padding': '12px'}), type='circle')
+                        ]),
+            ]),
         ])
     ])
 ])
@@ -374,6 +518,23 @@ bs_layout = html.Div([
         html.Div(style=SIDEBAR_STYLE, children=[
             html.H3("Option Inputs", style={'color': colors['accent'], 'marginBottom': '4px'}),
             html.P("Adjust parameters to price European options using the Black-Scholes model.", className='helper-text', style={'marginTop': '0'}),
+
+            # Ticker lookup — auto-fills Spot & Strike from live price
+            html.Label("Load from Ticker", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("Fetches live price to pre-fill Spot & Strike", className='helper-text'),
+            html.Div(style={'display': 'flex', 'gap': '8px', 'marginBottom': '4px'}, children=[
+                dcc.Input(id='bs-ticker-input', type='text', placeholder="e.g. AAPL, NVDA, SPY",
+                          style={**INPUT_STYLE, 'flex': 1}),
+                html.Button('Load', id='bs-load-btn', n_clicks=0, style={
+                    'padding': '10px 14px', 'backgroundColor': '#1a1a1a',
+                    'border': f"1px solid {colors['accent']}", 'borderRadius': '6px',
+                    'color': colors['accent'], 'fontWeight': 'bold', 'cursor': 'pointer',
+                    'whiteSpace': 'nowrap', 'fontSize': '0.9em'
+                }),
+            ]),
+            html.Div(id='bs-ticker-status', style={'minHeight': '18px', 'fontSize': '0.82em', 'marginBottom': '4px'}),
+            html.Hr(className='section-divider'),
+
             make_control_row("Spot Price ($)", "spot", 0, 800, 0.01, initial_spot,
                              helper="Current market price of the underlying asset"),
             make_control_row("Strike Price ($)", "strike", 0, 800, 0.01, initial_strike,
@@ -583,7 +744,7 @@ scanner_layout = html.Div([
                 html.P("How to read the table:", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.85em', 'marginBottom': '6px'}),
                 make_stat_row("IV %", "ATM implied vol (front-month)"),
                 make_stat_row("HV %", "30-day realized vol"),
-                make_stat_row("VRP", "IV minus HV (+ = options rich)"),
+                make_stat_row("VRP", "IV minus HV (+ = options expensive)"),
                 make_stat_row("IV/HV", "> 1.25x = Expensive, < 0.80x = Cheap"),
                 make_stat_row("Skew", "OTM put IV / ATM IV ratio"),
                 make_stat_row("HV Rank", "Realized vol percentile (1yr)"),
@@ -681,18 +842,22 @@ def toggle_tabs(tab_value):
     [Output('fund-info-display', 'children'), Output('fund-price-chart', 'figure'),
      Output('spot-input', 'value'), Output('spot-slider', 'value'),
      Output('strike-input', 'value'), Output('strike-slider', 'value')],
-    [Input('fund-submit-btn', 'n_clicks'), Input('fund-ticker-input', 'value')],
+    [Input('fund-submit-btn', 'n_clicks'), Input('fund-ticker-input', 'value'),
+     Input('fund-period-slider', 'value')],
     [State('fund-ticker-input', 'value')]
 )
-def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
+def update_fundamental_and_sync(n_clicks, input_val_trigger, period_slider_val, ticker_symbol):
     if not ticker_symbol: return (no_update,) * 6
 
     ticker_symbol = ticker_symbol.upper().strip()
+    selected_period = PERIOD_MAP.get(period_slider_val, '6mo')
+    period_labels = {0: '1 Month', 1: '3 Month', 2: '6 Month', 3: '1 Year', 4: '2 Year', 5: '5 Year', 6: 'Max'}
+    period_label = period_labels.get(period_slider_val, '6 Month')
 
     try:
         ticker = yf.Ticker(ticker_symbol)
         info = ticker.info
-        hist = ticker.history(period="6mo")
+        hist = ticker.history(period=selected_period)
 
         peg = info.get('pegRatio')
         pe = info.get('trailingPE')
@@ -756,7 +921,7 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
         # CHANGE: Added range fill beneath the line for visual clarity
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], fill='tozeroy',
                                  fillcolor='rgba(255, 102, 0, 0.08)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-        fig.update_layout(title=f"{ticker_symbol} - 6 Month History", yaxis_title="Price ($)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+        fig.update_layout(title=f"{ticker_symbol} - {period_label} History", yaxis_title="Price ($)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
 
         if not hist.empty:
             current_price = round(hist['Close'].iloc[-1], 2)
@@ -770,6 +935,181 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
             html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
         ])
         return err, go.Figure(layout=layout_settings), no_update, no_update, no_update, no_update
+
+# --- DCF CALLBACK ---
+@app.callback(
+    Output('fund-dcf-display', 'children'),
+    [Input('fund-submit-btn', 'n_clicks'),
+     Input('fund-dcf-growth', 'value'),
+     Input('fund-dcf-wacc', 'value'),
+     Input('fund-dcf-terminal', 'value')],
+    [State('fund-ticker-input', 'value')],
+    prevent_initial_call=True
+)
+def update_fund_dcf(_n_clicks, growth, wacc, terminal, ticker_symbol):
+    if not ticker_symbol:
+        return html.P("Enter a ticker and click Analyze.", style={'color': colors['muted'], 'fontStyle': 'italic'})
+    growth   = growth   or 10
+    wacc     = wacc     or 10
+    terminal = terminal or 2.5
+    sym = ticker_symbol.strip().upper()
+    result = compute_dcf(sym, growth, wacc, terminal)
+    if not result:
+        return html.Div([
+            html.P(f"DCF could not be computed for {sym}.",
+                   style={'color': colors['danger'], 'fontWeight': 'bold'}),
+            html.P("This is common for financials, REITs, or companies with negative FCF.",
+                   style={'color': colors['muted'], 'fontSize': '0.85em'}),
+        ])
+
+    intrinsic = result['intrinsic']
+    price     = result['price']
+    upside    = ((intrinsic - price) / price * 100) if price else None
+    upside_color = colors['call_text'] if upside and upside > 0 else colors['put_text']
+    upside_str = f"{upside:+.1f}%" if upside is not None else 'N/A'
+
+    def _bn(v):
+        """Format large dollar values into B/M."""
+        if abs(v) >= 1e9:  return f"${v/1e9:.2f}B"
+        if abs(v) >= 1e6:  return f"${v/1e6:.1f}M"
+        return f"${v:,.0f}"
+
+    # --- Summary cards ---
+    summary = html.Div(style={'display': 'flex', 'gap': '10px', 'marginBottom': '16px', 'flexWrap': 'wrap'}, children=[
+        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
+            html.Div("Intrinsic Value", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
+            html.Div(f"${intrinsic:.2f}", style={'color': colors['accent'], 'fontWeight': 'bold', 'fontSize': '1.3em'}),
+        ]),
+        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
+            html.Div("Current Price", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
+            html.Div(f"${price:.2f}" if price else 'N/A', style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1.3em'}),
+        ]),
+        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
+            html.Div("Upside / Downside", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
+            html.Div(upside_str, style={'color': upside_color, 'fontWeight': 'bold', 'fontSize': '1.3em'}),
+        ]),
+        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
+            html.Div("Enterprise Value", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
+            html.Div(_bn(result['ev']), style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1.1em'}),
+        ]),
+    ])
+
+    # --- Projected FCF table ---
+    years = [f"Year {i}" for i in range(1, 6)]
+    table_rows = [
+        html.Tr([html.Th("", style={'color': colors['muted'], 'padding': '6px 10px', 'textAlign': 'left'})]
+                + [html.Th(y, style={'color': colors['muted'], 'padding': '6px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for y in years],
+                style={'borderBottom': f"1px solid {colors['card_border']}"}),
+        html.Tr([html.Td("Projected FCF", style={'color': colors['text'], 'padding': '5px 10px', 'fontSize': '0.85em'})]
+                + [html.Td(_bn(v), style={'color': colors['accent'], 'padding': '5px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for v in result['proj']]),
+        html.Tr([html.Td("PV of FCF", style={'color': colors['text'], 'padding': '5px 10px', 'fontSize': '0.85em'})]
+                + [html.Td(_bn(v), style={'color': colors['call_text'], 'padding': '5px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for v in result['pv']]),
+    ]
+    proj_table = html.Div([
+        html.Div("5-Year FCF Projection", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '6px', 'fontSize': '0.9em'}),
+        html.Div(style={'overflowX': 'auto'}, children=[
+            html.Table(table_rows, style={'width': '100%', 'borderCollapse': 'collapse',
+                                          'backgroundColor': colors['card_bg'], 'borderRadius': '6px'})
+        ]),
+    ], style={'marginBottom': '14px'})
+
+    # --- Value bridge ---
+    bridge = html.Div([
+        html.Div("Valuation Bridge", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '8px', 'fontSize': '0.9em'}),
+        html.Div(style={'display': 'flex', 'gap': '8px', 'flexWrap': 'wrap'}, children=[
+            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
+                html.Div("PV of FCFs",     style={'color': colors['muted'], 'fontSize': '0.78em'}),
+                html.Div(_bn(sum(result['pv'])), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
+            ]),
+            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
+                html.Div("PV Terminal Val", style={'color': colors['muted'], 'fontSize': '0.78em'}),
+                html.Div(_bn(result['pv_tv']), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
+            ]),
+            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
+                html.Div("+ Cash",  style={'color': colors['muted'], 'fontSize': '0.78em'}),
+                html.Div(_bn(result['cash']), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
+            ]),
+            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
+                html.Div("− Debt",  style={'color': colors['muted'], 'fontSize': '0.78em'}),
+                html.Div(_bn(result['debt']), style={'color': colors['put_text'], 'fontWeight': 'bold'}),
+            ]),
+            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
+                html.Div("Equity Value", style={'color': colors['muted'], 'fontSize': '0.78em'}),
+                html.Div(_bn(result['equity_val']), style={'color': colors['accent'], 'fontWeight': 'bold'}),
+            ]),
+        ])
+    ])
+
+    return html.Div([summary, proj_table, bridge])
+
+
+# --- COMPS CALLBACK ---
+@app.callback(
+    Output('fund-comps-display', 'children'),
+    [Input('fund-submit-btn', 'n_clicks')],
+    [State('fund-ticker-input', 'value')],
+    prevent_initial_call=True
+)
+def update_fund_comps(_n, ticker_symbol):
+    if not ticker_symbol:
+        return html.P("Enter a ticker and click Analyze.", style={'color': colors['muted'], 'fontStyle': 'italic'})
+    sym = ticker_symbol.strip().upper()
+    try:
+        sector = yf.Ticker(sym).info.get('sector', '')
+    except:
+        sector = ''
+
+    peer_pool = SECTOR_PEERS.get(sector, [])
+    peers = [p for p in peer_pool if p != sym][:6]
+    all_syms = [sym] + peers
+
+    rows = [r for r in (get_comp_row(s) for s in all_syms) if r]
+    if not rows:
+        return html.P("Could not fetch comparables data.", style={'color': colors['danger']})
+
+    col_order = ['Ticker', 'Price', 'Mkt Cap', 'P/E', 'Fwd P/E', 'EV/EBITDA', 'P/S', 'P/B', 'Rev Gr', 'Op Mgn', 'ROE']
+    header_tips = {
+        'P/E':       'Price-to-Earnings (trailing 12 months)',
+        'Fwd P/E':   'Price-to-Earnings (next 12 months analyst estimate)',
+        'EV/EBITDA': 'Enterprise Value ÷ EBITDA',
+        'P/S':       'Price-to-Sales (trailing 12 months)',
+        'P/B':       'Price-to-Book Value',
+        'Rev Gr':    'Revenue growth year-over-year',
+        'Op Mgn':    'Operating margin (EBIT ÷ Revenue)',
+        'ROE':       'Return on Equity',
+    }
+
+    table = dash_table.DataTable(
+        data=rows,
+        columns=[{'name': c, 'id': c} for c in col_order],
+        style_table={'overflowX': 'auto'},
+        style_header={
+            'backgroundColor': '#1a1a1a', 'color': colors['accent'],
+            'fontWeight': 'bold', 'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
+        },
+        style_cell={
+            'backgroundColor': colors['card_bg'], 'color': colors['text'],
+            'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
+            'padding': '9px 12px', 'fontFamily': "'Segoe UI', Arial, sans-serif", 'fontSize': '0.88em',
+        },
+        style_data_conditional=[
+            {'if': {'filter_query': f'{{Ticker}} = "{sym}"'}, 'backgroundColor': '#0d0d20', 'fontWeight': 'bold'},
+            {'if': {'column_id': 'Ticker'}, 'color': colors['accent'], 'fontWeight': 'bold'},
+        ],
+        tooltip_header=header_tips,
+        tooltip_delay=0, tooltip_duration=None,
+        sort_action='native',
+    )
+
+    sector_label = f" — {sector}" if sector else ""
+    return html.Div([
+        html.Div(f"{sym} vs Sector Peers{sector_label}",
+                 style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '10px', 'fontSize': '0.9em'}),
+        html.Div(f"Subject company ({sym}) highlighted. Hover column headers for definitions.",
+                 className='helper-text', style={'marginBottom': '10px'}),
+        table,
+    ])
+
 
 # --- SPREAD ANALYSIS CALLBACK ---
 # CHANGE: Added z-score to stats, colored stat values, improved stat card layout
@@ -1091,7 +1431,7 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
             # CHANGE: VRP badge indicating if options are "rich" or "cheap"
             html.Div(style={'marginBottom': '12px', 'marginTop': '4px'}, children=[
                 html.Span(
-                    "Options Rich" if current_iv and (current_iv - current_hv) > 0 else "Options Cheap",
+                    "Options Expensive" if current_iv and (current_iv - current_hv) > 0 else "Options Cheap",
                     className=f"badge {'badge-green' if current_iv and (current_iv - current_hv) > 0 else 'badge-red'}"
                 )
             ]) if current_iv else html.Div(),
@@ -1142,6 +1482,33 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
             html.Div("Could not fetch data", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
             html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
         ])
+
+# --- BS TICKER LOOKUP ---
+@app.callback(
+    [Output('spot-input', 'value', allow_duplicate=True),
+     Output('spot-slider', 'value', allow_duplicate=True),
+     Output('strike-input', 'value', allow_duplicate=True),
+     Output('strike-slider', 'value', allow_duplicate=True),
+     Output('bs-ticker-status', 'children')],
+    [Input('bs-load-btn', 'n_clicks')],
+    [State('bs-ticker-input', 'value')],
+    prevent_initial_call=True
+)
+def load_bs_ticker_price(n_clicks, ticker_symbol):
+    if not n_clicks or not ticker_symbol:
+        return (no_update,) * 5
+    sym = ticker_symbol.strip().upper()
+    try:
+        hist = yf.Ticker(sym).history(period='5d')
+        if hist.empty:
+            return no_update, no_update, no_update, no_update, \
+                   html.Span(f'"{sym}" not found.', style={'color': colors['danger']})
+        price = round(hist['Close'].iloc[-1], 2)
+        status = html.Span(f"{sym} @ ${price:.2f}", style={'color': colors['call_text']})
+        return price, price, price, price, status
+    except Exception as e:
+        return no_update, no_update, no_update, no_update, \
+               html.Span(f"Error: {e}", style={'color': colors['danger']})
 
 # --- BLACK-SCHOLES SYNC ---
 def sync_input(slider_val, input_val):
