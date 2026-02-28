@@ -1,5 +1,5 @@
 import dash
-from dash import dcc, html, Input, Output, State, ctx, no_update
+from dash import dcc, html, Input, Output, State, ctx, no_update, dash_table
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
@@ -20,13 +20,14 @@ DEFAULT_VOL = 0.2
 DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
+DEFAULT_SCANNER_TICKERS = "SPY, QQQ, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL"
 
 colors = {
-    'background': '#1e1e1e', 'text': '#e0e0e0', 'card_bg': '#2c2c2c',
-    'input_bg': '#3a3a3a', 'call_text': '#69f0ae', 'put_text': '#ff8a80',
-    'accent': '#90caf9', 'success': '#00e676', 'danger': '#ff5252',
-    'muted': '#888',          # CHANGE: Added muted color for helper text
-    'card_border': '#444',    # CHANGE: Added consistent border color
+    'background': '#000000', 'text': '#ffffff', 'card_bg': '#0d0d0d',
+    'input_bg': '#1a1a1a', 'call_text': '#00c800', 'put_text': '#ff3300',
+    'accent': '#ff6600', 'success': '#00c800', 'danger': '#ff3300',
+    'muted': '#666',
+    'card_border': '#222',
 }
 
 layout_settings = dict(
@@ -96,7 +97,7 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_spot = go.Figure()
     fig_spot.add_trace(go.Scatter(x=spot_range, y=call_prices, mode='lines', name='Call Value', line=dict(color=colors['call_text'])))
     fig_spot.add_trace(go.Scatter(x=spot_range, y=put_prices, mode='lines', name='Put Value', line=dict(color=colors['put_text'])))
-    fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#888", annotation_text="Spot")
+    fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#666", annotation_text="Spot")
 
     fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)',
                            margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
@@ -130,6 +131,88 @@ def make_stat_row(label, value, value_color=None):
         html.Span(label, style={'color': colors['muted'], 'fontSize': '0.9em'}),
         html.Span(str(value), style={'fontWeight': 'bold', 'color': value_color or colors['text'], 'fontSize': '0.95em'})
     ])
+
+
+def generate_vol_signals(current_iv, current_hv, rvr, skew_ratio, term_slope):
+    """Generate trading signals from volatility smile data."""
+    signals = []
+    if current_iv and current_hv:
+        r = current_iv / current_hv
+        if r > 1.25:
+            signals.append({'label': 'VRP', 'signal': 'Sell Vol', 'detail': f'IV/HV={r:.2f}x — options overpriced vs realized', 'badge': 'badge-red'})
+        elif r < 0.80:
+            signals.append({'label': 'VRP', 'signal': 'Buy Vol', 'detail': f'IV/HV={r:.2f}x — options cheap vs realized', 'badge': 'badge-green'})
+        else:
+            signals.append({'label': 'VRP', 'signal': 'Neutral', 'detail': f'IV/HV={r:.2f}x — fairly priced', 'badge': 'badge-orange'})
+    if skew_ratio is not None:
+        if skew_ratio > 1.35:
+            signals.append({'label': 'Skew', 'signal': 'Bearish Fear', 'detail': f'OTM puts {skew_ratio:.2f}x ATM — market pricing tail risk', 'badge': 'badge-red'})
+        elif skew_ratio < 1.05:
+            signals.append({'label': 'Skew', 'signal': 'Complacent', 'detail': 'Flat skew — little downside demand', 'badge': 'badge-orange'})
+        else:
+            signals.append({'label': 'Skew', 'signal': 'Normal Skew', 'detail': f'OTM puts {skew_ratio:.2f}x ATM — healthy premium', 'badge': 'badge-green'})
+    if rvr > 80:
+        signals.append({'label': 'HV Rank', 'signal': 'Vol Elevated', 'detail': f'{rvr:.0f}th pct — mean reversion likely, sell realized vol', 'badge': 'badge-red'})
+    elif rvr < 20:
+        signals.append({'label': 'HV Rank', 'signal': 'Vol Suppressed', 'detail': f'{rvr:.0f}th pct — expansion likely, buy vol', 'badge': 'badge-green'})
+    else:
+        signals.append({'label': 'HV Rank', 'signal': 'Vol Normal', 'detail': f'{rvr:.0f}th pct — within historical range', 'badge': 'badge-orange'})
+    if term_slope is not None:
+        if term_slope < -2:
+            signals.append({'label': 'Term Struct', 'signal': 'Backwardation', 'detail': 'Near-term IV > far-term — stress or event risk priced in', 'badge': 'badge-red'})
+        elif term_slope > 2:
+            signals.append({'label': 'Term Struct', 'signal': 'Steep Contango', 'detail': 'Far-term IV >> near-term — calm now, risk priced ahead', 'badge': 'badge-orange'})
+        else:
+            signals.append({'label': 'Term Struct', 'signal': 'Normal Curve', 'detail': 'Balanced term structure', 'badge': 'badge-green'})
+    return signals
+
+
+def scan_ticker(ticker_symbol):
+    """Fetch vol metrics for one ticker and return a table row dict."""
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        hist = ticker.history(period="1y")
+        if hist.empty or len(hist) < 30:
+            return None
+        hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
+        hist['HV'] = hist['Log_Ret'].rolling(window=30).std() * np.sqrt(252) * 100
+        hist = hist.dropna()
+        current_hv = hist['HV'].iloc[-1]
+        hv_rank = ((current_hv - hist['HV'].min()) / (hist['HV'].max() - hist['HV'].min())) * 100
+
+        current_iv, skew_ratio = None, None
+        options = ticker.options
+        if options:
+            today = datetime.datetime.now().date()
+            valid = [e for e in options if (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 7]
+            exp = valid[0] if valid else options[0]
+            chain = ticker.option_chain(exp)
+            spot = hist['Close'].iloc[-1]
+            atm = chain.calls.iloc[(chain.calls['strike'] - spot).abs().argsort()[:1]]
+            if not atm.empty:
+                current_iv = atm['impliedVolatility'].values[0] * 100
+            closest_put = chain.puts.iloc[(chain.puts['strike'] - spot * 0.90).abs().argsort()[:1]]
+            if not closest_put.empty and current_iv:
+                skew_ratio = closest_put['impliedVolatility'].values[0] * 100 / current_iv
+
+        vrp = (current_iv - current_hv) if current_iv else None
+        vrp_ratio = (current_iv / current_hv) if current_iv and current_hv else None
+        verdict = ('Expensive' if vrp_ratio and vrp_ratio > 1.25
+                   else 'Cheap' if vrp_ratio and vrp_ratio < 0.80
+                   else 'Neutral' if vrp_ratio else 'N/A')
+
+        return {
+            'Ticker': ticker_symbol,
+            'IV %': f"{current_iv:.1f}" if current_iv else 'N/A',
+            'HV %': f"{current_hv:.1f}",
+            'VRP': f"{vrp:+.1f}" if vrp is not None else 'N/A',
+            'IV/HV': f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
+            'Skew': f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
+            'HV Rank': f"{hv_rank:.0f}%",
+            'Verdict': verdict,
+        }
+    except:
+        return None
 
 
 # -----------------------------------------------------------------------------
@@ -168,7 +251,7 @@ FLEX_WRAPPER_STYLE = {
 INPUT_STYLE = {
     'width': '100%', 'boxSizing': 'border-box', 'padding': '10px',
     'backgroundColor': colors['input_bg'], 'color': 'white',
-    'border': '1px solid #555', 'borderRadius': '6px', 'fontSize': '0.95em'
+    'border': '1px solid #333', 'borderRadius': '6px', 'fontSize': '0.95em'
 }
 
 # CHANGE: Standardized button style
@@ -176,7 +259,7 @@ BUTTON_STYLE = {
     'width': '100%', 'boxSizing': 'border-box', 'padding': '12px',
     'backgroundColor': colors['accent'], 'border': 'none', 'borderRadius': '6px',
     'fontWeight': 'bold', 'cursor': 'pointer', 'fontSize': '0.95em',
-    'color': '#1e1e1e', 'letterSpacing': '0.3px'
+    'color': '#000000', 'letterSpacing': '0.3px'
 }
 
 def make_control_row(label, id_prefix, min_val, max_val, step, default_val, helper=None):
@@ -190,7 +273,7 @@ def make_control_row(label, id_prefix, min_val, max_val, step, default_val, help
     children.append(
         html.Div(style={'display': 'flex', 'alignItems': 'center', 'gap': '15px'}, children=[
             dcc.Input(id=f'{id_prefix}-input', type='number', value=default_val, step=step,
-                      style={'width': '80px', 'padding': '6px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #555', 'borderRadius': '6px', 'fontSize': '0.9em'}),
+                      style={'width': '80px', 'padding': '6px', 'backgroundColor': colors['input_bg'], 'color': 'white', 'border': '1px solid #333', 'borderRadius': '6px', 'fontSize': '0.9em'}),
             html.Div(style={'flex': '1'}, children=[
                 dcc.Slider(id=f'{id_prefix}-slider', min=min_val, max=max_val, step=step, value=default_val, marks=None, tooltip={"placement": "bottom", "always_visible": True})
             ])
@@ -267,14 +350,14 @@ bs_layout = html.Div([
             # CHANGE: Redesigned price cards with more visual weight and moneyness indicator
             html.Div(style={'display': 'flex', 'gap': '12px', 'marginBottom': '16px'}, children=[
                 html.Div(style={
-                    'flex': 1, 'backgroundColor': '#1a2e1a', 'padding': '16px', 'borderRadius': '10px',
+                    'flex': 1, 'backgroundColor': '#001500', 'padding': '16px', 'borderRadius': '10px',
                     'textAlign': 'center', 'border': f"1px solid {colors['call_text']}"
                 }, children=[
                     html.Div("CALL", style={'margin': '0', 'fontSize': '0.75em', 'color': colors['call_text'], 'letterSpacing': '1px', 'fontWeight': 'bold'}),
                     html.H2(id='call-price-display', style={'margin': '8px 0 0 0', 'color': colors['call_text'], 'fontSize': '1.8em'})
                 ]),
                 html.Div(style={
-                    'flex': 1, 'backgroundColor': '#2e1a1a', 'padding': '16px', 'borderRadius': '10px',
+                    'flex': 1, 'backgroundColor': '#150000', 'padding': '16px', 'borderRadius': '10px',
                     'textAlign': 'center', 'border': f"1px solid {colors['put_text']}"
                 }, children=[
                     html.Div("PUT", style={'margin': '0', 'fontSize': '0.75em', 'color': colors['put_text'], 'letterSpacing': '1px', 'fontWeight': 'bold'}),
@@ -304,10 +387,10 @@ bs_layout = html.Div([
             ]),
             html.Div(style={'backgroundColor': colors['card_bg'], 'borderRadius': '10px'}, children=[
                 dcc.Tabs(style={'color': colors['text']}, children=[
-                    dcc.Tab(label='Payoff', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                    dcc.Tab(label='Payoff', style={'backgroundColor': colors['card_bg'], 'color': '#666'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
                         dcc.Graph(id='payoff-graph', style={'height': '50vh', 'minHeight': '350px'})  # CHANGE: Reduced height to accommodate Greeks cards
                     ]),
-                    dcc.Tab(label='Greeks', style={'backgroundColor': colors['card_bg'], 'color': '#888'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
+                    dcc.Tab(label='Greeks', style={'backgroundColor': colors['card_bg'], 'color': '#666'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
                         dcc.Graph(id='greeks-graph', style={'height': '50vh', 'minHeight': '350px'})
                     ]),
                 ])
@@ -358,12 +441,12 @@ spread_layout = html.Div([
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Tabs(style={'color': colors['text']}, children=[
-                dcc.Tab(label='Normalized Performance', style={'backgroundColor': colors['card_bg'], 'color': '#888'},
+                dcc.Tab(label='Normalized Performance', style={'backgroundColor': colors['card_bg'], 'color': '#666'},
                         selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
                     dcc.Loading(dcc.Graph(id='spread-norm-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
                 ]),
                 # CHANGE: Expanded tab label from "Spread Ratio" to full text for clarity
-                dcc.Tab(label='Spread Ratio', style={'backgroundColor': colors['card_bg'], 'color': '#888'},
+                dcc.Tab(label='Spread Ratio', style={'backgroundColor': colors['card_bg'], 'color': '#666'},
                         selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
                     dcc.Loading(dcc.Graph(id='spread-ratio-chart', style={'height': '60vh', 'minHeight': '400px'}), type='circle')
                 ]),
@@ -443,6 +526,36 @@ vol_analytics_layout = html.Div([
 ])
 
 
+# --- 6. SCANNER TAB LAYOUT ---
+scanner_layout = html.Div([
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
+        html.Div(style=SIDEBAR_STYLE, children=[
+            html.H3("Stock Scanner", style={'color': colors['accent'], 'marginBottom': '4px'}),
+            html.P("Scan multiple tickers to find cheap or expensive options based on IV vs realized vol.", className='helper-text', style={'marginTop': '0'}),
+            html.Label("Tickers to Scan", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("Comma-separated. Edit or add your own.", className='helper-text'),
+            dcc.Textarea(id='scanner-tickers-input', value=DEFAULT_SCANNER_TICKERS,
+                         style={**INPUT_STYLE, 'height': '80px', 'resize': 'vertical', 'fontFamily': 'monospace'}),
+            html.Button('Scan Options', id='scanner-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '10px'}),
+            html.Hr(className='section-divider'),
+            html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.85em', 'fontStyle': 'italic'}),
+            html.Hr(className='section-divider'),
+            html.Div([
+                html.P("How to read the table:", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.85em', 'marginBottom': '6px'}),
+                make_stat_row("IV %", "ATM implied vol (front-month)"),
+                make_stat_row("HV %", "30-day realized vol"),
+                make_stat_row("VRP", "IV minus HV (+ = options rich)"),
+                make_stat_row("IV/HV", "> 1.25x = Expensive, < 0.80x = Cheap"),
+                make_stat_row("Skew", "OTM put IV / ATM IV ratio"),
+                make_stat_row("HV Rank", "Realized vol percentile (1yr)"),
+            ])
+        ]),
+        html.Div(style=CONTENT_STYLE, children=[
+            dcc.Loading(html.Div(id='scanner-results-table'), type='circle')
+        ])
+    ])
+])
+
 # --- APP LAYOUT ---
 # CHANGE: Revamped header with subtitle, added footer
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 10px 0 10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
@@ -464,20 +577,23 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
              children=[
                 # CHANGE: Expanded tab labels for clarity (e.g. "Spread" -> "Spread Analysis")
                 dcc.Tab(label='Fundamentals', value='tab-fundamental',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Black-Scholes', value='tab-bs',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Spread Analysis', value='tab-spread',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Vol Surface', value='tab-vol',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Vol Analytics', value='tab-va',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#888', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#444', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Scanner', value='tab-scanner',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
     html.Div(id='fund-content-wrapper', children=fundamental_layout, style={'display': 'block'}),
@@ -485,6 +601,7 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
     html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'}),
+    html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'none'}),
 
     # CHANGE: Added footer with context so the app feels polished
     html.Div(style={
@@ -506,17 +623,18 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 @app.callback(
     [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'),
      Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style'),
-     Output('va-content-wrapper', 'style')],
+     Output('va-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    fund_style, bs_style, spread_style, vol_style, va_style = [{'display': 'none'}] * 5
+    fund_style, bs_style, spread_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 6
     if tab_value == 'tab-fundamental': fund_style = {'display': 'block'}
     elif tab_value == 'tab-bs': bs_style = {'display': 'block'}
     elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
     elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
     elif tab_value == 'tab-va': va_style = {'display': 'block'}
-    return fund_style, bs_style, spread_style, vol_style, va_style
+    elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
+    return fund_style, bs_style, spread_style, vol_style, va_style, scanner_style
 
 # Main Fundamental Analysis Callback
 # CHANGE: Revamped the info display to use a grid of metric cards instead of plain text
@@ -583,7 +701,7 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
                 # CHANGE: Added 52W Range bar showing where current price sits
                 html.Div(className='metric-card', children=[
                     html.Div("52W Range", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '6px', 'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
-                    html.Div(style={'position': 'relative', 'height': '6px', 'backgroundColor': '#555', 'borderRadius': '3px', 'overflow': 'hidden'}, children=[
+                    html.Div(style={'position': 'relative', 'height': '6px', 'backgroundColor': '#333', 'borderRadius': '3px', 'overflow': 'hidden'}, children=[
                         html.Div(style={
                             'position': 'absolute', 'left': '0', 'top': '0', 'height': '100%',
                             'width': f"{((hist['Close'].iloc[-1] - fifty_two_low) / (fifty_two_high - fifty_two_low) * 100) if fifty_two_high and fifty_two_low and fifty_two_high != fifty_two_low else 50}%",
@@ -598,7 +716,7 @@ def update_fundamental_and_sync(n_clicks, input_val_trigger, ticker_symbol):
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Close', line=dict(color=colors['accent'], width=2)))
         # CHANGE: Added range fill beneath the line for visual clarity
         fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], fill='tozeroy',
-                                 fillcolor='rgba(144, 202, 249, 0.08)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
+                                 fillcolor='rgba(255, 102, 0, 0.08)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
         fig.update_layout(title=f"{ticker_symbol} - 6 Month History", yaxis_title="Price ($)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
 
         if not hist.empty:
@@ -676,7 +794,7 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
             html.Div(style={'marginTop': '8px'}, children=[
                 html.Span(
                     "Near Mean" if abs(z_score) < 1 else ("Extended" if abs(z_score) < 2 else "Extreme"),
-                    className=f"badge {'badge-green' if abs(z_score) < 1 else ('badge-blue' if abs(z_score) < 2 else 'badge-red')}"
+                    className=f"badge {'badge-green' if abs(z_score) < 1 else ('badge-orange' if abs(z_score) < 2 else 'badge-red')}"
                 )
             ])
         ])
@@ -783,19 +901,19 @@ def update_vol_surface(n_clicks, plot_type, ticker_symbol):
 
                 xaxis=dict(
                     backgroundcolor=colors['card_bg'],
-                    gridcolor="#555",
+                    gridcolor="#333",
                     showbackground=True,
                     range=[min_strike, max_strike]
                 ),
                 yaxis=dict(
                     backgroundcolor=colors['card_bg'],
-                    gridcolor="#555",
+                    gridcolor="#333",
                     showbackground=True,
                     range=[min_dte, max_dte]
                 ),
                 zaxis=dict(
                     backgroundcolor=colors['card_bg'],
-                    gridcolor="#555",
+                    gridcolor="#333",
                     showbackground=True
                 )
             ),
@@ -876,18 +994,35 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
 
             fig_skew.add_trace(go.Scatter(x=puts_skew['strike'], y=puts_skew['impliedVolatility']*100, mode='lines+markers', name='Puts IV', line=dict(color=colors['put_text'])))
             fig_skew.add_trace(go.Scatter(x=calls_skew['strike'], y=calls_skew['impliedVolatility']*100, mode='lines+markers', name='Calls IV', line=dict(color=colors['call_text'])))
-            fig_skew.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="#888", annotation_text="Spot")
+            fig_skew.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="#666", annotation_text="Spot")
 
             fig_skew.update_layout(title=f"Live Volatility Skew (Expiry: {target_exp})", xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility (%)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
 
             otm_put_target = spot_price * 0.90
             closest_put = puts.iloc[(puts['strike'] - otm_put_target).abs().argsort()[:1]]
+            skew_ratio_num = None
             if not closest_put.empty and current_iv:
                 otm_put_iv = closest_put['impliedVolatility'].values[0] * 100
-                skew_ratio = otm_put_iv / current_iv
-                skew_ratio_text = f"{skew_ratio:.2f}x"
+                skew_ratio_num = otm_put_iv / current_iv
+                skew_ratio_text = f"{skew_ratio_num:.2f}x"
+
+            # Term structure: compare front-month vs back-month ATM IV
+            back_month_iv = None
+            back_valid = [exp for exp in options if (datetime.datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 45]
+            if back_valid and current_iv:
+                try:
+                    back_chain = ticker.option_chain(back_valid[0])
+                    back_calls = back_chain.calls
+                    atm_back = back_calls.iloc[(back_calls['strike'] - spot_price).abs().argsort()[:1]]
+                    if not atm_back.empty:
+                        back_month_iv = atm_back['impliedVolatility'].values[0] * 100
+                except:
+                    pass
+            term_slope = (back_month_iv - current_iv) if back_month_iv else None
 
         else:
+            skew_ratio_num = None
+            term_slope = None
             fig_skew.update_layout(title="No Options Data Available for Skew", **layout_settings)
 
         fig_hv = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
@@ -935,7 +1070,7 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
                     html.Span(f"{rvr:.1f}%", style={'fontWeight': 'bold', 'color': colors['call_text'] if rvr < 50 else colors['put_text']})
                 ]),
                 # CHANGE: Visual progress bar for HV rank
-                html.Div(style={'height': '8px', 'backgroundColor': '#444', 'borderRadius': '4px', 'overflow': 'hidden'}, children=[
+                html.Div(style={'height': '8px', 'backgroundColor': '#1a1a1a', 'borderRadius': '4px', 'overflow': 'hidden'}, children=[
                     html.Div(style={
                         'height': '100%', 'borderRadius': '4px',
                         'width': f"{min(rvr, 100)}%",
@@ -948,7 +1083,17 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
                     html.Span("Low", style={'color': '#666', 'fontSize': '0.7em'}),
                     html.Span("High", style={'color': '#666', 'fontSize': '0.7em'})
                 ])
-            ])
+            ]),
+
+            html.Hr(className='section-divider'),
+            html.H4("Trading Signals", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
+            *[html.Div(style={'marginBottom': '10px'}, children=[
+                html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '3px'}, children=[
+                    html.Span(s['label'], style={'color': colors['muted'], 'fontSize': '0.8em', 'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
+                    html.Span(s['signal'], className=f"badge {s['badge']}")
+                ]),
+                html.Div(s['detail'], style={'color': colors['muted'], 'fontSize': '0.75em', 'fontStyle': 'italic'})
+            ]) for s in generate_vol_signals(current_iv, current_hv, rvr, skew_ratio_num, term_slope)]
         ])
 
         return fig_hv, fig_skew, stats_html
@@ -1010,6 +1155,43 @@ def calc_bs(S, K, T, r, sigma):
         greek_card_content("Theta", theta),
         greek_card_content("Vega", vega),
     )
+
+# --- SCANNER CALLBACK ---
+@app.callback(
+    [Output('scanner-results-table', 'children'), Output('scanner-status', 'children')],
+    [Input('scanner-submit-btn', 'n_clicks')],
+    [State('scanner-tickers-input', 'value')]
+)
+def run_scanner(n_clicks, tickers_raw):
+    if not n_clicks or not tickers_raw:
+        return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), ""
+    tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
+    rows = [r for r in (scan_ticker(t) for t in tickers) if r]
+    if not rows:
+        return html.Div("No data returned. Check tickers.", style={'color': colors['danger'], 'padding': '20px'}), ""
+
+    table = dash_table.DataTable(
+        data=rows,
+        columns=[{'name': c, 'id': c} for c in ['Ticker', 'IV %', 'HV %', 'VRP', 'IV/HV', 'Skew', 'HV Rank', 'Verdict']],
+        style_table={'overflowX': 'auto'},
+        style_header={
+            'backgroundColor': '#1a1a1a', 'color': colors['accent'],
+            'fontWeight': 'bold', 'border': f"1px solid {colors['card_border']}", 'textAlign': 'center'
+        },
+        style_cell={
+            'backgroundColor': colors['card_bg'], 'color': colors['text'],
+            'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
+            'padding': '10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"
+        },
+        style_data_conditional=[
+            {'if': {'filter_query': '{Verdict} = "Expensive"'}, 'backgroundColor': '#150000', 'color': colors['put_text']},
+            {'if': {'filter_query': '{Verdict} = "Cheap"'}, 'backgroundColor': '#001500', 'color': colors['call_text']},
+            {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']},
+        ],
+        sort_action='native',
+    )
+    return table, f"Scanned {len(rows)} of {len(tickers)} tickers."
+
 
 if __name__ == '__main__':
     app.run(debug=True)
