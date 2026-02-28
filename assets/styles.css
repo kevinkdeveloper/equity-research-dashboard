@@ -2,6 +2,17 @@
    EQUITY RESEARCH DASHBOARD - Global Styles (Bloomberg Theme)
    ============================================================================= */
 
+/* --- Remove browser default margin/padding (eliminates white border) --- */
+*, *::before, *::after {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background-color: #000000;
+}
+
 /* --- Smooth transitions on all interactive elements --- */
 button, input, .dash-dropdown, a {
     transition: all 0.2s ease-in-out !important;
@@ -131,4 +142,73 @@ input:focus {
     background-color: rgba(255, 102, 0, 0.15);
     color: #ff6600;
     border: 1px solid rgba(255, 102, 0, 0.3);
+}
+
+/* =============================================================================
+   RESPONSIVE LAYOUT
+   ============================================================================= */
+
+/* --- Tablet: 641px–1024px — sidebar narrows, content stays beside it --- */
+@media (max-width: 1024px) {
+    /* Let sidebar shrink a bit more aggressively */
+    .stat-card, .metric-card {
+        padding: 8px 12px;
+    }
+}
+
+/* --- Mobile: ≤640px — single-column stacked layout --- */
+@media (max-width: 640px) {
+    /* Reduce outer app padding on small screens */
+    body > div {
+        padding-left: 8px !important;
+        padding-right: 8px !important;
+    }
+
+    /* Tab bar: scrollable horizontally so labels don't wrap or overflow */
+    .tab-container, [class*="tabs--container"] {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+        flex-wrap: nowrap !important;
+    }
+
+    /* Shrink individual tab labels */
+    .custom-tab, [class*="tab--"] {
+        padding: 10px 8px !important;
+        font-size: 0.72em !important;
+        white-space: nowrap;
+        min-width: 80px !important;
+    }
+
+    /* Sidebar + content each become full-width (flex-wrap already handles stacking,
+       but we ensure min-width doesn't fight it) */
+    [style*="flex: 1 1 350px"], [style*="flex: 3 1 500px"] {
+        flex: 1 1 100% !important;
+        min-width: 0 !important;
+    }
+
+    /* Tighten cards */
+    .stat-card, .metric-card {
+        padding: 8px 10px;
+        font-size: 0.9em;
+    }
+
+    /* Reduce heading size */
+    h1 {
+        font-size: 1.2rem !important;
+    }
+
+    h3 {
+        font-size: 1rem !important;
+    }
+
+    /* Charts: shorter on mobile so they don't dominate the screen */
+    .js-plotly-plot {
+        max-height: 55vh !important;
+    }
+
+    /* DataTable: horizontal scroll on mobile */
+    .dash-spreadsheet-container {
+        overflow-x: auto !important;
+        -webkit-overflow-scrolling: touch;
+    }
 }

@@ -20,7 +20,7 @@ DEFAULT_VOL = 0.2
 DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
-DEFAULT_SCANNER_TICKERS = "SPY, QQQ, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL"
+DEFAULT_SCANNER_TICKERS = "SPY, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL, GLD, SLV"
 
 colors = {
     'background': '#000000', 'text': '#ffffff', 'card_bg': '#0d0d0d',
@@ -180,7 +180,7 @@ def scan_ticker(ticker_symbol):
         current_hv = hist['HV'].iloc[-1]
         hv_rank = ((current_hv - hist['HV'].min()) / (hist['HV'].max() - hist['HV'].min())) * 100
 
-        current_iv, skew_ratio = None, None
+        current_iv, skew_ratio, pc_vol_ratio = None, None, None
         options = ticker.options
         if options:
             today = datetime.datetime.now().date()
@@ -188,12 +188,22 @@ def scan_ticker(ticker_symbol):
             exp = valid[0] if valid else options[0]
             chain = ticker.option_chain(exp)
             spot = hist['Close'].iloc[-1]
+
+            # ATM IV (calls)
             atm = chain.calls.iloc[(chain.calls['strike'] - spot).abs().argsort()[:1]]
             if not atm.empty:
                 current_iv = atm['impliedVolatility'].values[0] * 100
+
+            # Put skew: 90% strike vs ATM call IV
             closest_put = chain.puts.iloc[(chain.puts['strike'] - spot * 0.90).abs().argsort()[:1]]
             if not closest_put.empty and current_iv:
                 skew_ratio = closest_put['impliedVolatility'].values[0] * 100 / current_iv
+
+            # Put/Call volume ratio across whole chain
+            total_call_vol = chain.calls['volume'].fillna(0).sum()
+            total_put_vol = chain.puts['volume'].fillna(0).sum()
+            if total_call_vol > 0:
+                pc_vol_ratio = total_put_vol / total_call_vol
 
         vrp = (current_iv - current_hv) if current_iv else None
         vrp_ratio = (current_iv / current_hv) if current_iv and current_hv else None
@@ -201,15 +211,46 @@ def scan_ticker(ticker_symbol):
                    else 'Cheap' if vrp_ratio and vrp_ratio < 0.80
                    else 'Neutral' if vrp_ratio else 'N/A')
 
+        # --- Directional bias: skew + P/C volume each cast a vote ---
+        skew_bearish = skew_ratio is not None and skew_ratio > 1.15
+        skew_bullish = skew_ratio is not None and skew_ratio < 0.88
+        pc_bearish   = pc_vol_ratio is not None and pc_vol_ratio > 1.10
+        pc_bullish   = pc_vol_ratio is not None and pc_vol_ratio < 0.75
+        bear_votes = int(skew_bearish) + int(pc_bearish)
+        bull_votes = int(skew_bullish) + int(pc_bullish)
+        bias = "Bearish" if bear_votes > bull_votes else "Bullish" if bull_votes > bear_votes else "Neutral"
+
+        # --- Recommendations: direction + VRP tells you whether to buy or sell premium ---
+        iv_cheap     = vrp_ratio is not None and vrp_ratio < 0.85
+        iv_expensive = vrp_ratio is not None and vrp_ratio > 1.25
+
+        if bias == "Bullish" and iv_cheap:
+            call_rec = "Buy"
+        elif bias == "Bearish" and iv_expensive:
+            call_rec = "Sell"
+        else:
+            call_rec = "Hold"
+
+        if bias == "Bearish" and iv_cheap:
+            put_rec = "Buy"
+        elif bias == "Bullish" and iv_expensive:
+            put_rec = "Sell"
+        else:
+            put_rec = "Hold"
+
         return {
-            'Ticker': ticker_symbol,
-            'IV %': f"{current_iv:.1f}" if current_iv else 'N/A',
-            'HV %': f"{current_hv:.1f}",
-            'VRP': f"{vrp:+.1f}" if vrp is not None else 'N/A',
-            'IV/HV': f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
-            'Skew': f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
-            'HV Rank': f"{hv_rank:.0f}%",
-            'Verdict': verdict,
+            'Ticker':   ticker_symbol,
+            'IV %':     f"{current_iv:.1f}" if current_iv else 'N/A',
+            'HV %':     f"{current_hv:.1f}",
+            'VRP':      f"{vrp:+.1f}" if vrp is not None else 'N/A',
+            'IV/HV':    f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
+            'Skew':     f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
+            'P/C Vol':  f"{pc_vol_ratio:.2f}" if pc_vol_ratio else 'N/A',
+            'HV Rank':  f"{hv_rank:.0f}%",
+            'Bias':     bias,
+            'Call Rec': call_rec,
+            'Put Rec':  put_rec,
+            'Verdict':  verdict,
         }
     except:
         return None
@@ -243,8 +284,6 @@ FLEX_WRAPPER_STYLE = {
     'display': 'flex',
     'flexWrap': 'wrap',
     'gap': '20px',
-    'maxWidth': '1400px',
-    'margin': '0 auto'
 }
 
 # CHANGE: Standardized input style to reduce repetition and ensure consistency
@@ -558,10 +597,10 @@ scanner_layout = html.Div([
 
 # --- APP LAYOUT ---
 # CHANGE: Revamped header with subtitle, added footer
-app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 10px 0 10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
+app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 20px 0 20px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
 
     # CHANGE: Revamped header with subtitle and visual separator
-    html.Div(style={'textAlign': 'center', 'padding': '16px 0 8px 0', 'maxWidth': '1400px', 'margin': '0 auto'}, children=[
+    html.Div(style={'textAlign': 'center', 'padding': '16px 0 8px 0'}, children=[
         html.H1("Equity Research Dashboard", style={
             'color': colors['text'], 'fontSize': '1.6rem', 'margin': '0', 'fontWeight': '700', 'letterSpacing': '0.5px'
         }),
@@ -573,7 +612,7 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 
     # Navigation Tabs
     dcc.Tabs(id='main-tabs', value='tab-fundamental',
-             style={'marginTop': '16px', 'marginBottom': '20px', 'maxWidth': '1400px', 'margin': '16px auto 20px auto'},
+             style={'marginTop': '16px', 'marginBottom': '20px'},
              children=[
                 # CHANGE: Expanded tab labels for clarity (e.g. "Spread" -> "Spread Analysis")
                 dcc.Tab(label='Fundamentals', value='tab-fundamental',
@@ -606,7 +645,7 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
     # CHANGE: Added footer with context so the app feels polished
     html.Div(style={
         'textAlign': 'center', 'padding': '20px 0', 'marginTop': '30px',
-        'borderTop': f"1px solid {colors['card_border']}", 'maxWidth': '1400px', 'margin': '30px auto 0 auto'
+        'borderTop': f"1px solid {colors['card_border']}",
     }, children=[
         html.P("Market data provided by Yahoo Finance. Options priced using the Black-Scholes model.",
                style={'color': colors['muted'], 'fontSize': '0.75em', 'margin': '0'}),
@@ -1170,9 +1209,10 @@ def run_scanner(n_clicks, tickers_raw):
     if not rows:
         return html.Div("No data returned. Check tickers.", style={'color': colors['danger'], 'padding': '20px'}), ""
 
+    col_order = ['Ticker', 'IV %', 'HV %', 'VRP', 'IV/HV', 'Skew', 'P/C Vol', 'HV Rank', 'Bias', 'Call Rec', 'Put Rec', 'Verdict']
     table = dash_table.DataTable(
         data=rows,
-        columns=[{'name': c, 'id': c} for c in ['Ticker', 'IV %', 'HV %', 'VRP', 'IV/HV', 'Skew', 'HV Rank', 'Verdict']],
+        columns=[{'name': c, 'id': c} for c in col_order],
         style_table={'overflowX': 'auto'},
         style_header={
             'backgroundColor': '#1a1a1a', 'color': colors['accent'],
@@ -1184,11 +1224,35 @@ def run_scanner(n_clicks, tickers_raw):
             'padding': '10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"
         },
         style_data_conditional=[
+            # Verdict coloring
             {'if': {'filter_query': '{Verdict} = "Expensive"'}, 'backgroundColor': '#150000', 'color': colors['put_text']},
-            {'if': {'filter_query': '{Verdict} = "Cheap"'}, 'backgroundColor': '#001500', 'color': colors['call_text']},
+            {'if': {'filter_query': '{Verdict} = "Cheap"'},     'backgroundColor': '#001500', 'color': colors['call_text']},
+            # Bias coloring
+            {'if': {'filter_query': '{Bias} = "Bearish"', 'column_id': 'Bias'}, 'color': colors['put_text'], 'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Bias} = "Bullish"', 'column_id': 'Bias'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Bias} = "Neutral"', 'column_id': 'Bias'}, 'color': colors['muted']},
+            # Call Rec coloring
+            {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Call Rec} = "Hold"', 'column_id': 'Call Rec'}, 'color': colors['muted']},
+            # Put Rec coloring
+            {'if': {'filter_query': '{Put Rec} = "Buy"',   'column_id': 'Put Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Put Rec} = "Sell"',  'column_id': 'Put Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
+            {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'}, 'color': colors['muted']},
+            # Ticker highlight
             {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']},
         ],
         sort_action='native',
+        tooltip_header={
+            'Skew':    'OTM 90% put IV ÷ ATM call IV. >1.15 = bearish skew, <0.88 = bullish',
+            'P/C Vol': 'Total put volume ÷ total call volume. >1.10 = bearish, <0.75 = bullish',
+            'Bias':    'Directional vote from Skew + P/C Vol. Both must agree for Bullish/Bearish.',
+            'Call Rec':'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
+            'Put Rec': 'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
+            'Verdict': 'IV/HV ratio. >1.25x = Expensive (sell premium). <0.80x = Cheap (buy premium).',
+        },
+        tooltip_delay=0,
+        tooltip_duration=None,
     )
     return table, f"Scanned {len(rows)} of {len(tickers)} tickers."
 
