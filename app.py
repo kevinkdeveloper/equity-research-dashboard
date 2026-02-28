@@ -1,3 +1,4 @@
+import os
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update, dash_table
 import plotly.graph_objects as go
@@ -8,6 +9,11 @@ from scipy.interpolate import griddata
 import yfinance as yf
 import pandas as pd
 import datetime
+try:
+    from polygon import RESTClient as PolygonClient
+    POLYGON_AVAILABLE = True
+except ImportError:
+    POLYGON_AVAILABLE = False
 
 # -----------------------------------------------------------------------------
 # 1. SETTINGS & DEFAULTS
@@ -21,6 +27,7 @@ DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
 DEFAULT_SCANNER_TICKERS = "SPY, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL, GLD, SLV"
+POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', '')
 
 SECTOR_PEERS = {
     'Technology':             ['MSFT', 'AAPL', 'NVDA', 'GOOGL', 'META', 'AMD', 'INTC', 'CRM', 'ADBE', 'ORCL'],
@@ -257,6 +264,109 @@ def get_comp_row(sym):
         }
     except:
         return None
+
+
+def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key, as_of_date=None):
+    """
+    Pull an options chain snapshot from Polygon.io and return
+    (data_dict, error_string).
+    Pass as_of_date (YYYY-MM-DD str) for a historical surface;
+    omit or pass None for the live snapshot.
+    Historical snapshots require Polygon Business plan or above.
+    """
+    if not POLYGON_AVAILABLE:
+        return None, "polygon-api-client not installed. Run: pip install polygon-api-client"
+    if not api_key or not api_key.strip():
+        return None, "No API key. Enter your Polygon.io key in the sidebar."
+
+    try:
+        client = PolygonClient(api_key=api_key.strip())
+        today = datetime.date.today()
+        today_str = today.isoformat()
+        is_historical = as_of_date and as_of_date != today_str
+
+        params = {"limit": 250}
+        if contract_type in ("call", "put"):
+            params["contract_type"] = contract_type
+        if is_historical:
+            params["as_of"] = as_of_date
+
+        contracts = list(client.list_snapshot_options_chain(
+            ticker_symbol.upper(), params=params
+        ))
+
+        if not contracts:
+            return None, (
+                f"No options data returned for {ticker_symbol}. "
+                "Check your API key or ensure your plan includes options data."
+            )
+
+        # Pull spot price from the first contract's underlying_asset field
+        spot = None
+        for c in contracts:
+            if c.underlying_asset and c.underlying_asset.price:
+                spot = c.underlying_asset.price
+                break
+
+        # Use the as_of date (if historical) as reference for DTE calculation
+        ref_date = datetime.date.fromisoformat(as_of_date) if is_historical else today
+
+        strikes, dtes, ivs, prices, deltas, volumes = [], [], [], [], [], []
+        expirations_seen = set()
+
+        for c in contracts:
+            iv = c.implied_volatility
+            if not iv or iv < 0.005:
+                continue
+            if not c.details:
+                continue
+
+            strike = c.details.strike_price
+            exp_str = c.details.expiration_date   # "YYYY-MM-DD"
+
+            # Moneyness filter (skip deep ITM / OTM)
+            if spot and not (spot * (1 - moneyness_pct) <= strike <= spot * (1 + moneyness_pct)):
+                continue
+
+            exp_date = datetime.date.fromisoformat(exp_str)
+            dte = (exp_date - ref_date).days
+            if dte <= 0:
+                continue
+
+            # Option price: prefer bid-ask midpoint, fall back to last trade, then day close
+            opt_price = None
+            if c.last_quote and c.last_quote.midpoint:
+                opt_price = c.last_quote.midpoint
+            elif c.last_trade and c.last_trade.price:
+                opt_price = c.last_trade.price
+            elif c.day and c.day.close:
+                opt_price = c.day.close
+
+            strikes.append(strike)
+            dtes.append(dte)
+            ivs.append(iv)           # Polygon returns as decimal (0.25 = 25%)
+            prices.append(opt_price)
+            expirations_seen.add(exp_str)
+
+            deltas.append(abs(c.greeks.delta) if c.greeks and c.greeks.delta is not None else None)
+            volumes.append(c.day.volume if c.day and c.day.volume else 0)
+
+        if len(strikes) < 5:
+            return None, "Too few liquid contracts returned. Try widening the moneyness range."
+
+        return {
+            "strikes": strikes, "dtes": dtes, "ivs": ivs, "prices": prices,
+            "deltas": deltas, "volumes": volumes,
+            "spot": spot,
+            "contract_count": len(strikes),
+            "exp_count": len(expirations_seen),
+        }, None
+
+    except Exception as e:
+        msg = str(e)
+        if "403" in msg or "Forbidden" in msg:
+            return None, "API key rejected or plan doesn't include options. Check polygon.io account."
+        return None, f"Polygon error: {msg}"
 
 
 def scan_ticker(ticker_symbol):
@@ -660,33 +770,79 @@ vol_surface_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
             html.H3("Vol Surface", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Visualize how implied volatility varies across strikes and expirations.", className='helper-text', style={'marginTop': '0'}),
+            html.P("Live implied volatility surface powered by Polygon.io.", className='helper-text', style={'marginTop': '0'}),
+
+            html.Label("Polygon.io API Key", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("Get key at polygon.io · Starter plan required for options", className='helper-text'),
+            dcc.Input(id='vol-api-key-input', type='password', value=POLYGON_API_KEY,
+                      placeholder="paste your API key here",
+                      style={**INPUT_STYLE, 'marginBottom': '12px', 'fontFamily': 'monospace'}),
 
             html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
             dcc.Input(id='vol-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY, AAPL, TSLA",
                       style={**INPUT_STYLE, 'marginBottom': '12px'}),
 
+            html.Label("Surface Date", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("Today = live snapshot. Past date = historical (Business plan+).", className='helper-text'),
+            dcc.DatePickerSingle(
+                id='vol-date-picker',
+                date=datetime.date.today().isoformat(),
+                max_date_allowed=datetime.date.today().isoformat(),
+                min_date_allowed='2016-01-01',
+                display_format='YYYY-MM-DD',
+                style={'marginBottom': '12px', 'width': '100%'},
+            ),
+
+            html.Label("Contract Type", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            dcc.RadioItems(
+                id='vol-contract-type',
+                options=[
+                    {'label': ' Calls',    'value': 'call'},
+                    {'label': ' Puts',     'value': 'put'},
+                    {'label': ' Both',     'value': 'both'},
+                ],
+                value='call',
+                labelStyle={'display': 'inline-block', 'color': colors['text'], 'marginRight': '14px', 'cursor': 'pointer'},
+                style={'marginBottom': '10px'},
+            ),
+
+            html.Label("Moneyness Range", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            html.Div("Only show strikes within ± % of spot price", className='helper-text'),
+            html.Div(style={'padding': '0 10px 16px 10px'}, children=[
+                dcc.Slider(id='vol-moneyness-slider', min=10, max=40, step=5, value=25,
+                           marks={10: '±10%', 20: '±20%', 30: '±30%', 40: '±40%'},
+                           tooltip={"placement": "bottom", "always_visible": False}),
+            ]),
+
+            html.Label("Z-Axis", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            dcc.RadioItems(
+                id='vol-z-axis',
+                options=[
+                    {'label': ' Implied Vol (%)',   'value': 'iv'},
+                    {'label': ' Option Price ($)',  'value': 'price'},
+                ],
+                value='iv',
+                labelStyle={'display': 'inline-block', 'color': colors['text'], 'marginRight': '14px', 'cursor': 'pointer'},
+                style={'marginBottom': '10px'},
+            ),
+
             html.Label("Plot Type", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block', 'fontSize': '0.9em'}),
-            # CHANGE: Added descriptions to radio options so users understand the difference
             dcc.RadioItems(
                 id='vol-plot-type',
                 options=[
-                    {'label': ' Surface (Interpolated)', 'value': 'surface'},
-                    {'label': ' Scatter (Raw Data)', 'value': 'scatter'}
+                    {'label': ' Surface (interpolated)', 'value': 'surface'},
+                    {'label': ' Scatter (raw quotes)',    'value': 'scatter'},
                 ],
                 value='surface',
                 labelStyle={'display': 'block', 'color': colors['text'], 'marginBottom': '5px', 'cursor': 'pointer'},
-                style={'marginBottom': '10px'}
+                style={'marginBottom': '10px'},
             ),
-            html.Div("Surface smooths the data; Scatter shows actual market quotes.", className='helper-text'),
 
-            html.Button('Fetch Options Data', id='vol-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '10px'}),
+            html.Button('Fetch Surface', id='vol-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '6px'}),
             html.Hr(className='section-divider'),
-            html.Div(id='vol-info-display',
-                children=html.Div([
-                    html.P("Options data will load here.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-                ])
-            )
+            html.Div(id='vol-info-display', children=html.Div([
+                html.P("Surface data will appear here after fetch.", style={'color': colors['muted'], 'fontStyle': 'italic'})
+            ]))
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Loading(dcc.Graph(id='vol-surface-chart', style={'height': '70vh', 'minHeight': '500px'}), type='circle')
@@ -1186,138 +1342,130 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
             html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
         ])
 
-# --- VOLATILITY SURFACE CALLBACK ---
-# CHANGE: Improved info panel with more context about the data
+# --- VOLATILITY SURFACE CALLBACK (Polygon.io) ---
 @app.callback(
     [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children')],
-    [Input('vol-submit-btn', 'n_clicks'), Input('vol-plot-type', 'value')],
-    [State('vol-ticker-input', 'value')]
+    [Input('vol-submit-btn', 'n_clicks')],
+    [State('vol-ticker-input', 'value'),
+     State('vol-api-key-input', 'value'),
+     State('vol-date-picker', 'date'),
+     State('vol-contract-type', 'value'),
+     State('vol-moneyness-slider', 'value'),
+     State('vol-z-axis', 'value'),
+     State('vol-plot-type', 'value')],
+    prevent_initial_call=True
 )
-def update_vol_surface(n_clicks, plot_type, ticker_symbol):
+def update_vol_surface(_n, ticker_symbol, api_key, as_of_date, contract_type, moneyness_slider, z_axis, plot_type):
+    empty_fig = go.Figure(layout=layout_settings)
     if not ticker_symbol:
-        return go.Figure(layout=layout_settings), html.Div()
+        return empty_fig, html.Div()
 
-    ticker_symbol = ticker_symbol.upper().strip()
+    sym = ticker_symbol.upper().strip()
+    moneyness_pct = (moneyness_slider or 25) / 100
 
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        expirations = ticker.options
-
-        if not expirations:
-            return go.Figure(layout=layout_settings), html.Div("No options data available for this ticker.", style={'color': colors['danger']})
-
-        expirations = list(expirations)[:8]
-
-        hist = ticker.history(period="1d")
-        if hist.empty:
-            return go.Figure(layout=layout_settings), html.Div("Could not fetch underlying price.", style={'color': colors['danger']})
-
-        spot_price = hist['Close'].iloc[-1]
-
-        strikes, dtes, ivs = [], [], []
-        today = datetime.datetime.now().replace(tzinfo=None)
-
-        for exp in expirations:
-            exp_date = datetime.datetime.strptime(exp, "%Y-%m-%d")
-            dte = (exp_date - today).days
-            if dte <= 0: dte = 0.5
-
-            chain = ticker.option_chain(exp)
-            calls = chain.calls
-
-            calls = calls[(calls['strike'] >= spot_price * 0.7) & (calls['strike'] <= spot_price * 1.3)]
-            calls = calls[(calls['impliedVolatility'] > 0.01) & (calls['volume'] > 0)]
-
-            for _, row in calls.iterrows():
-                strikes.append(row['strike'])
-                dtes.append(dte)
-                ivs.append(row['impliedVolatility'])
-
-        if len(strikes) < 5:
-            return go.Figure(layout=layout_settings), html.Div("Not enough liquid options data to plot. Try a more popular ticker.", style={'color': colors['danger']})
-
-        min_strike, max_strike = min(strikes), max(strikes)
-        min_dte, max_dte = min(dtes), max(dtes)
-
-        fig = go.Figure()
-
-        if plot_type == 'surface':
-            strike_grid = np.linspace(min_strike, max_strike, 40)
-            dte_grid = np.linspace(min_dte, max_dte, 40)
-            X, Y = np.meshgrid(strike_grid, dte_grid)
-
-            Z = griddata((strikes, dtes), ivs, (X, Y), method='cubic')
-            if np.isnan(Z).all():
-                 Z = griddata((strikes, dtes), ivs, (X, Y), method='linear')
-
-            fig.add_trace(go.Surface(z=Z, x=X, y=Y, colorscale='Jet', colorbar=dict(title="IV")))
-
-        else:
-            fig.add_trace(go.Scatter3d(
-                x=strikes, y=dtes, z=ivs,
-                mode='markers',
-                marker=dict(
-                    size=4,
-                    color=ivs,
-                    colorscale='Jet',
-                    opacity=0.8,
-                    colorbar=dict(title="IV")
-                ),
-                name='Raw IV'
-            ))
-
-        fig.update_layout(
-            title=f"{ticker_symbol} Call Implied Volatility ({plot_type.title()})",
-            scene=dict(
-                camera=dict(
-                    up=dict(x=0, y=0, z=1),
-                    center=dict(x=0, y=0, z=0),
-                    eye=dict(x=-1.8, y=-1.2, z=1.0)
-                ),
-                xaxis_title='Strike Price ($)',
-                yaxis_title='Days to Expiration (DTE)',
-                zaxis_title='Implied Volatility',
-
-                xaxis=dict(
-                    backgroundcolor=colors['card_bg'],
-                    gridcolor="#333",
-                    showbackground=True,
-                    range=[min_strike, max_strike]
-                ),
-                yaxis=dict(
-                    backgroundcolor=colors['card_bg'],
-                    gridcolor="#333",
-                    showbackground=True,
-                    range=[min_dte, max_dte]
-                ),
-                zaxis=dict(
-                    backgroundcolor=colors['card_bg'],
-                    gridcolor="#333",
-                    showbackground=True
-                )
-            ),
-            margin=dict(l=0, r=0, t=40, b=0),
-            **layout_settings
-        )
-
-        # CHANGE: Enhanced info panel with more context about the loaded data
-        info_html = html.Div([
-            html.H4("Surface Data", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-            make_stat_row("Spot Price", f"${spot_price:.2f}", colors['accent']),
-            make_stat_row("Data Points", f"{len(strikes):,}"),
-            make_stat_row("Expirations", f"{len(expirations)}"),
-            make_stat_row("Strike Range", f"${min_strike:.0f} - ${max_strike:.0f}"),
-            make_stat_row("DTE Range", f"{min_dte:.0f} - {max_dte:.0f} days"),
-            make_stat_row("IV Range", f"{min(ivs)*100:.1f}% - {max(ivs)*100:.1f}%"),
+    data, err = fetch_polygon_surface(sym, contract_type, moneyness_pct, api_key, as_of_date=as_of_date)
+    if err:
+        info = html.Div([
+            html.Div("Data fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
+            html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
         ])
+        return empty_fig, info
 
-        return fig, info_html
+    strikes = data['strikes']
+    dtes    = data['dtes']
+    ivs     = data['ivs']
+    raw_prices = data['prices']
+    spot    = data['spot']
 
-    except Exception as e:
-        return go.Figure(layout=layout_settings), html.Div([
-            html.Div("Could not fetch data", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
-            html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
-        ])
+    min_strike, max_strike = min(strikes), max(strikes)
+    min_dte,    max_dte    = min(dtes),    max(dtes)
+
+    # Choose Z values and axis labels based on selector
+    use_price = (z_axis == 'price')
+    if use_price:
+        # Drop points without a valid price
+        valid = [(s, d, p) for s, d, p in zip(strikes, dtes, raw_prices) if p is not None]
+        if len(valid) < 5:
+            return empty_fig, html.Div(
+                "Not enough contracts with valid price quotes. Try IV (%) instead.",
+                style={'color': colors['danger'], 'fontSize': '0.9em'}
+            )
+        z_strikes, z_dtes, z_vals = zip(*valid)
+        z_strikes, z_dtes, z_vals = list(z_strikes), list(z_dtes), list(z_vals)
+        z_label      = "Price ($)"
+        z_tickprefix = "$"
+        z_ticksuffix = ""
+        hover_z      = "$%{z:.2f}"
+    else:
+        z_strikes, z_dtes = strikes, dtes
+        z_vals = [v * 100 for v in ivs]   # decimal → percent
+        z_label      = "IV (%)"
+        z_tickprefix = ""
+        z_ticksuffix = "%"
+        hover_z      = "%{z:.1f}%"
+
+    ct_label  = {'call': 'Call', 'put': 'Put', 'both': 'Call + Put'}.get(contract_type, '')
+    z_display = "Option Price" if use_price else "Implied Vol"
+    spot_label = f"  Spot: ${spot:.2f}" if spot else ""
+
+    fig = go.Figure()
+
+    if plot_type == 'surface':
+        sg = np.linspace(min(z_strikes), max(z_strikes), 50)
+        dg = np.linspace(min(z_dtes),    max(z_dtes),    50)
+        X, Y = np.meshgrid(sg, dg)
+        Z = griddata((z_strikes, z_dtes), z_vals, (X, Y), method='cubic')
+        if np.isnan(Z).all():
+            Z = griddata((z_strikes, z_dtes), z_vals, (X, Y), method='linear')
+        fig.add_trace(go.Surface(
+            z=Z, x=X, y=Y,
+            colorscale='Jet',
+            colorbar=dict(title=z_label, tickprefix=z_tickprefix, ticksuffix=z_ticksuffix),
+            hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
+        ))
+    else:
+        fig.add_trace(go.Scatter3d(
+            x=z_strikes, y=z_dtes, z=z_vals,
+            mode='markers',
+            marker=dict(size=3, color=z_vals, colorscale='Jet', opacity=0.85,
+                        colorbar=dict(title=z_label, tickprefix=z_tickprefix, ticksuffix=z_ticksuffix)),
+            hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
+            name=z_display,
+        ))
+
+    fig.update_layout(
+        title=f"{sym} {ct_label} {z_display} Surface — {as_of_date or 'Live'}{spot_label}",
+        scene=dict(
+            camera=dict(up=dict(x=0,y=0,z=1), center=dict(x=0,y=0,z=0), eye=dict(x=-1.8,y=-1.2,z=1.0)),
+            xaxis_title='Strike ($)',
+            yaxis_title='DTE (days)',
+            zaxis_title=z_label,
+            xaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
+            yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
+            zaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
+        ),
+        margin=dict(l=0, r=0, t=40, b=0),
+        **layout_settings
+    )
+
+    iv_pcts = [v * 100 for v in ivs]
+    price_vals = [p for p in raw_prices if p is not None]
+    info_html = html.Div([
+        html.H4("Surface Data · Polygon.io", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
+        make_stat_row("Source",  "Polygon.io — Historical" if as_of_date and as_of_date != datetime.date.today().isoformat() else "Polygon.io — Live"),
+        make_stat_row("Date",    as_of_date or datetime.date.today().isoformat()),
+        make_stat_row("Spot Price",   f"${spot:.2f}" if spot else "N/A", colors['accent']),
+        make_stat_row("Contracts",    f"{data['contract_count']:,}"),
+        make_stat_row("Expirations",  f"{data['exp_count']}"),
+        make_stat_row("Strike Range", f"${min_strike:.0f} – ${max_strike:.0f}"),
+        make_stat_row("DTE Range",    f"{min_dte} – {max_dte} days"),
+        make_stat_row("IV Range",     f"{min(iv_pcts):.1f}% – {max(iv_pcts):.1f}%"),
+        *([ make_stat_row("Price Range", f"${min(price_vals):.2f} – ${max(price_vals):.2f}") ] if price_vals else []),
+        make_stat_row("Moneyness",    f"±{int(moneyness_pct*100)}% of spot"),
+    ])
+
+    return fig, info_html
+
 
 # --- VOLATILITY ANALYTICS CALLBACK ---
 # CHANGE: Improved stats panel with visual indicators and better organization
