@@ -1,0 +1,137 @@
+/* =============================================================================
+   EQUITY RESEARCH DASHBOARD - Global Styles
+
+   CHANGE: Added external CSS because inline styles can't handle :hover, :focus,
+   transitions, or pseudo-elements. This file is auto-loaded by Dash from /assets/.
+   ============================================================================= */
+
+/* --- CHANGE: Smooth transitions on all interactive elements --- */
+button, input, .dash-dropdown, a {
+    transition: all 0.2s ease-in-out !important;
+}
+
+/* --- CHANGE: Button hover/active feedback so users know buttons are clickable --- */
+button:hover {
+    filter: brightness(1.15) !important;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(144, 202, 249, 0.3) !important;
+}
+
+button:active {
+    transform: translateY(0px);
+    filter: brightness(0.95) !important;
+}
+
+/* --- CHANGE: Input focus glow so users see which field is active --- */
+input:focus {
+    outline: none !important;
+    border-color: #90caf9 !important;
+    box-shadow: 0 0 0 2px rgba(144, 202, 249, 0.25) !important;
+}
+
+/* --- CHANGE: Styled scrollbar for dark theme consistency --- */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: #1e1e1e;
+}
+
+::-webkit-scrollbar-thumb {
+    background: #555;
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: #777;
+}
+
+/* --- CHANGE: Card hover effect for stat cards --- */
+.stat-card {
+    transition: all 0.2s ease-in-out;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 12px 16px;
+    background-color: #333;
+}
+
+.stat-card:hover {
+    border-color: #90caf9;
+    background-color: #383838;
+}
+
+/* --- CHANGE: Metric card layout for fundamentals info grid --- */
+.metric-card {
+    background-color: #333;
+    border: 1px solid #444;
+    border-radius: 8px;
+    padding: 12px 16px;
+    text-align: center;
+    transition: border-color 0.2s ease;
+}
+
+.metric-card:hover {
+    border-color: #90caf9;
+}
+
+/* --- CHANGE: Tab underline animation --- */
+.tab--selected {
+    transition: border-color 0.2s ease-in-out !important;
+}
+
+/* --- CHANGE: Loading spinner color override for dark theme --- */
+._dash-loading {
+    color: #90caf9 !important;
+}
+
+/* --- CHANGE: Better tooltip styling for sliders --- */
+.rc-slider-tooltip-inner {
+    background-color: #444 !important;
+    border: 1px solid #666 !important;
+    font-size: 12px !important;
+}
+
+/* --- CHANGE: Helper text styling --- */
+.helper-text {
+    color: #888;
+    font-size: 0.8em;
+    margin-top: 2px;
+    margin-bottom: 8px;
+    font-style: italic;
+}
+
+/* --- CHANGE: Section divider styling --- */
+.section-divider {
+    border: none;
+    border-top: 1px solid #444;
+    margin: 16px 0;
+}
+
+/* --- CHANGE: Badge/pill styling for status indicators --- */
+.badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.8em;
+    font-weight: bold;
+}
+
+.badge-green {
+    background-color: rgba(0, 230, 118, 0.15);
+    color: #00e676;
+    border: 1px solid rgba(0, 230, 118, 0.3);
+}
+
+.badge-red {
+    background-color: rgba(255, 82, 82, 0.15);
+    color: #ff5252;
+    border: 1px solid rgba(255, 82, 82, 0.3);
+}
+
+.badge-blue {
+    background-color: rgba(144, 202, 249, 0.15);
+    color: #90caf9;
+    border: 1px solid rgba(144, 202, 249, 0.3);
+}
