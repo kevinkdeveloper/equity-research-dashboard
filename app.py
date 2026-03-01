@@ -529,7 +529,8 @@ bs_layout = html.Div([
 ])
 
 # --- 3. SPREAD ANALYSIS TAB LAYOUT ---
-PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '2y', 5: '5y', 6: 'max'}
+PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '2y', 5: '5y', 6: '10y', 7: 'max'}
+CAL_PERIOD_MAP = {0: '1y', 1: '2y', 2: '3y', 3: '5y', 4: '10y', 5: 'max'}
 
 SPREAD_LINE_COLORS = [
     '#ff6600',  # orange (accent)
@@ -570,9 +571,9 @@ spread_layout = html.Div([
             html.Div(style={'padding': '0 10px 20px 10px'}, children=[
                 dcc.Slider(
                     id='spread-period-slider',
-                    min=0, max=6, step=1,
+                    min=0, max=7, step=1,
                     value=2,
-                    marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: 'MAX'},
+                    marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: '10Y', 7: 'MAX'},
                 )
             ]),
 
@@ -745,6 +746,32 @@ scanner_layout = html.Div([
     ])
 ])
 
+# --- CALENDAR RETURNS LAYOUT ---
+cal_layout = html.Div([
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
+        html.Div(style=SIDEBAR_STYLE, children=[
+            html.H3("Calendar Returns", style={'color': colors['accent'], 'marginBottom': '4px'}),
+            html.P("Monthly return heatmap — green positive, red negative.", className='helper-text', style={'marginTop': '0'}),
+            html.Label("Ticker", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            dcc.Input(id='cal-ticker-input', type='text', placeholder='e.g. SPY', debounce=False,
+                      style={**INPUT_STYLE, 'marginBottom': '14px'}),
+            html.Label("Lookback Period", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            html.Div("How many years of monthly data to show.", className='helper-text'),
+            dcc.Slider(id='cal-period-slider', min=0, max=5, step=1, value=2,
+                       marks={0: '1Y', 1: '2Y', 2: '3Y', 3: '5Y', 4: '10Y', 5: 'MAX'}),
+            html.Button('Load Calendar', id='cal-submit-btn', n_clicks=0,
+                        style={**BUTTON_STYLE, 'marginTop': '14px'}),
+            html.Hr(className='section-divider'),
+            html.Div(id='cal-stats-display',
+                     children=html.Div("Stats will appear here after loading.",
+                                       style={'color': colors['muted'], 'fontStyle': 'italic'})),
+        ]),
+        html.Div(style=CONTENT_STYLE, children=[
+            dcc.Loading(html.Div(id='cal-heatmap-output'), type='circle')
+        ])
+    ])
+])
+
 # --- APP LAYOUT ---
 # CHANGE: Revamped header with subtitle, added footer
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 20px 0 20px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
@@ -770,6 +797,9 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Spread Analysis', value='tab-spread',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Calendar', value='tab-cal',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Vol Surface', value='tab-vol',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
@@ -783,6 +813,7 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 
     html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
+    html.Div(id='cal-content-wrapper', children=cal_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
     html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'}),
     html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'block'}),
@@ -806,18 +837,20 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 # Tab Visibility Toggle
 @app.callback(
     [Output('bs-content-wrapper', 'style'),
-     Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style'),
+     Output('spread-content-wrapper', 'style'), Output('cal-content-wrapper', 'style'),
+     Output('vol-content-wrapper', 'style'),
      Output('va-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    bs_style, spread_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 5
+    bs_style, spread_style, cal_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 6
     if tab_value == 'tab-bs': bs_style = {'display': 'block'}
     elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
+    elif tab_value == 'tab-cal': cal_style = {'display': 'block'}
     elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
     elif tab_value == 'tab-va': va_style = {'display': 'block'}
     elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
-    return bs_style, spread_style, vol_style, va_style, scanner_style
+    return bs_style, spread_style, cal_style, vol_style, va_style, scanner_style
 
 # --- SPREAD ANALYSIS CALLBACK ---
 @app.callback(
@@ -874,6 +907,20 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
             ret = (df[col].iloc[-1] / df[col].iloc[0] - 1) * 100
             ret_color = colors['call_text'] if ret >= 0 else colors['put_text']
             stat_rows.append(make_stat_row(col, f"{ret:+.1f}%", ret_color))
+
+        if len(df.columns) >= 2:
+            corr = df.pct_change().corr()
+            pairs = [(a, b) for i, a in enumerate(df.columns) for b in list(df.columns)[i+1:]]
+            stat_rows += [
+                html.Hr(className='section-divider'),
+                html.H4("Correlation", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
+            ]
+            for a, b in pairs:
+                val = corr.loc[a, b]
+                cor_color = (colors['call_text'] if val > 0.7
+                             else colors['put_text'] if val < 0.3
+                             else colors['text'])
+                stat_rows.append(make_stat_row(f"{a}/{b}", f"{val:.2f}", cor_color))
 
         return fig_norm, html.Div(stat_rows)
 
@@ -1356,6 +1403,104 @@ def calc_bs(S, K, T, r, sigma):
         greek_card_content("Theta", theta),
         greek_card_content("Vega", vega),
     )
+
+# --- CALENDAR RETURNS CALLBACK ---
+@app.callback(
+    [Output('cal-heatmap-output', 'children'), Output('cal-stats-display', 'children')],
+    [Input('cal-submit-btn', 'n_clicks')],
+    [State('cal-ticker-input', 'value'), State('cal-period-slider', 'value')],
+    prevent_initial_call=True
+)
+def run_calendar(_n_clicks, ticker_raw, slider_val):
+    if not ticker_raw:
+        return html.Div("Enter a ticker and click Load.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), html.Div()
+
+    ticker_sym = ticker_raw.strip().upper()
+    period = CAL_PERIOD_MAP.get(slider_val, '5y')
+
+    try:
+        hist = yf.Ticker(ticker_sym).history(period=period)
+        if hist.empty:
+            return html.Div("No data found.", style={'color': colors['danger']}), html.Div()
+
+        monthly = hist['Close'].resample('ME').last()
+        monthly_ret = monthly.pct_change().dropna() * 100
+
+        df_cal = pd.DataFrame({
+            'Year': monthly_ret.index.year,
+            'Month': monthly_ret.index.month,
+            'Return': monthly_ret.values
+        })
+        pivot = df_cal.pivot(index='Year', columns='Month', values='Return')
+        pivot = pivot.sort_index(ascending=False)
+
+        month_labels = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+        col_labels = [month_labels[m - 1] for m in pivot.columns]
+
+        text_matrix = []
+        for yr in pivot.index:
+            row_text = []
+            for m in pivot.columns:
+                val = pivot.loc[yr, m]
+                row_text.append(f"{val:+.1f}%" if not pd.isna(val) else "")
+            text_matrix.append(row_text)
+
+        fig = go.Figure(go.Heatmap(
+            z=pivot.values.tolist(),
+            x=col_labels,
+            y=[str(y) for y in pivot.index],
+            text=text_matrix,
+            texttemplate="%{text}",
+            textfont=dict(size=11, color='black'),
+            colorscale='RdYlGn',
+            zmid=0,
+            showscale=True,
+            colorbar=dict(
+                title=dict(text='Return %', font=dict(color=colors['muted'])),
+                tickfont=dict(color=colors['muted']),
+                bgcolor=colors['card_bg'],
+            ),
+            hovertemplate="<b>%{y} %{x}</b><br>Return: %{z:.2f}%<extra></extra>",
+        ))
+
+        fig.update_layout(
+            title=dict(text=f"{ticker_sym} — Monthly Returns ({period.upper()})", font=dict(color=colors['text'])),
+            paper_bgcolor=colors['card_bg'],
+            plot_bgcolor=colors['card_bg'],
+            font=dict(color=colors['text']),
+            xaxis=dict(side='top', tickfont=dict(color=colors['text']), gridcolor=colors['card_border']),
+            yaxis=dict(tickfont=dict(color=colors['text']), gridcolor=colors['card_border']),
+            margin=dict(l=60, r=20, t=80, b=20),
+            height=max(350, len(pivot.index) * 42 + 140),
+        )
+
+        annual = monthly_ret.groupby(monthly_ret.index.year).apply(
+            lambda x: ((1 + x / 100).prod() - 1) * 100
+        )
+        pos_months = int((monthly_ret > 0).sum())
+        total_months = len(monthly_ret)
+
+        stat_rows = [
+            html.H4("Summary", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
+            make_stat_row("Ticker", ticker_sym),
+            make_stat_row("Period", period.upper()),
+            make_stat_row("Hit Rate", f"{pos_months}/{total_months} ({pos_months / total_months * 100:.0f}%)"),
+            make_stat_row("Best Month", f"{monthly_ret.max():+.1f}%", colors['call_text']),
+            make_stat_row("Worst Month", f"{monthly_ret.min():+.1f}%", colors['put_text']),
+            html.Hr(className='section-divider'),
+            html.H4("Annual Returns", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
+        ]
+        for yr in sorted(annual.index, reverse=True):
+            ret = annual[yr]
+            ret_color = colors['call_text'] if ret >= 0 else colors['put_text']
+            stat_rows.append(make_stat_row(str(yr), f"{ret:+.1f}%", ret_color))
+
+        return dcc.Graph(figure=fig, config={'displayModeBar': False}), html.Div(stat_rows)
+
+    except Exception as e:
+        return html.Div(f"Error: {e}", style={'color': colors['danger']}), html.Div()
+
 
 # --- SCANNER CALLBACK ---
 @app.callback(
