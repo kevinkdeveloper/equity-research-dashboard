@@ -27,21 +27,38 @@ DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
 DEFAULT_SCANNER_TICKERS = "SPY, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL, GLD, SLV"
-POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', '')
+POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'qvG5Nf6OFdw8Od7oMVeUo7B0q3lB0zbo')
 
-SECTOR_PEERS = {
-    'Technology':             ['MSFT', 'AAPL', 'NVDA', 'GOOGL', 'META', 'AMD', 'INTC', 'CRM', 'ADBE', 'ORCL'],
-    'Consumer Cyclical':      ['AMZN', 'TSLA', 'HD', 'MCD', 'NKE', 'SBUX', 'TGT', 'LOW', 'BKNG', 'ABNB'],
-    'Financial Services':     ['JPM', 'BAC', 'GS', 'MS', 'WFC', 'BLK', 'C', 'AXP', 'V', 'MA'],
-    'Healthcare':             ['UNH', 'JNJ', 'PFE', 'ABBV', 'MRK', 'TMO', 'ABT', 'BMY', 'AMGN', 'LLY'],
-    'Communication Services': ['GOOGL', 'META', 'NFLX', 'DIS', 'VZ', 'T', 'CMCSA', 'SNAP'],
-    'Industrials':            ['HON', 'UPS', 'CAT', 'BA', 'GE', 'LMT', 'RTX', 'DE', 'EMR', 'MMM'],
-    'Consumer Defensive':     ['PG', 'KO', 'PEP', 'WMT', 'COST', 'PM', 'CL', 'GIS', 'MO'],
-    'Energy':                 ['XOM', 'CVX', 'COP', 'SLB', 'EOG', 'MPC', 'VLO', 'OXY', 'PSX'],
-    'Utilities':              ['NEE', 'DUK', 'SO', 'D', 'AEP', 'EXC', 'XEL', 'ES', 'ED'],
-    'Real Estate':            ['AMT', 'PLD', 'CCI', 'EQIX', 'PSA', 'O', 'WELL', 'SPG', 'AVB'],
-    'Basic Materials':        ['LIN', 'APD', 'ECL', 'NEM', 'FCX', 'ALB', 'NUE', 'CF', 'DD'],
-}
+# --- Historical vol-surface date slider: weekly steps for the past ~2 years ---
+def _make_surface_dates():
+    today = datetime.date.today()
+    dates, d = [], today - datetime.timedelta(weeks=104)
+    while d <= today:
+        if d.weekday() < 5:          # weekdays only
+            dates.append(d.isoformat())
+        d += datetime.timedelta(weeks=1)
+    if today.isoformat() not in dates:
+        dates.append(today.isoformat())
+    return dates
+
+SURFACE_DATES = _make_surface_dates()
+
+def _make_surface_marks():
+    marks, seen = {}, set()
+    for i, d in enumerate(SURFACE_DATES):
+        date = datetime.date.fromisoformat(d)
+        key = (date.year, date.month)
+        if date.month in (1, 4, 7, 10) and key not in seen:   # quarterly only
+            seen.add(key)
+            marks[i] = {'label': date.strftime("%b '%y"),
+                        'style': {'color': '#888', 'fontSize': '10px'}}
+    marks[len(SURFACE_DATES) - 1] = {
+        'label': 'Today', 'style': {'color': '#ff6600', 'fontSize': '10px', 'fontWeight': 'bold'}
+    }
+    return marks
+
+SURFACE_MARKS = _make_surface_marks()
+
 
 colors = {
     'background': '#000000', 'text': '#ffffff', 'card_bg': '#0d0d0d',
@@ -121,7 +138,8 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#666", annotation_text="Spot")
 
     fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)',
-                           margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+                           margin=dict(l=20, r=20, t=40, b=20), uirevision='bs-spot',
+                           transition=dict(duration=150, easing='cubic-in-out'), **layout_settings)
 
     greeks_call = [calculate_greeks(s, K, T, r, sigma, 'call') for s in spot_range]
     delta_c, gamma_c, theta_c, vega_c = zip(*greeks_call)
@@ -132,17 +150,10 @@ def get_bs_charts(S, K, T, r, sigma):
     fig_greeks.add_trace(go.Scatter(x=spot_range, y=theta_c, name='Call Theta', line=dict(color=colors['call_text']), showlegend=False), 2, 1)
     fig_greeks.add_trace(go.Scatter(x=spot_range, y=vega_c, name='Vega', line=dict(color=colors['accent']), showlegend=False), 2, 2)
 
-    fig_greeks.update_layout(title="Greeks Sensitivity", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+    fig_greeks.update_layout(title="Greeks Sensitivity", margin=dict(l=20, r=20, t=40, b=20), uirevision='bs-greeks',
+                             transition=dict(duration=150, easing='cubic-in-out'), **layout_settings)
     return fig_spot, fig_greeks
 
-
-# CHANGE: Helper to build a metric card used across Fundamentals and other tabs
-def make_metric_card(label, value, color=None):
-    """Creates a compact metric card with label on top and value below."""
-    return html.Div(className='metric-card', children=[
-        html.Div(label, style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px', 'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
-        html.Div(str(value), style={'color': color or colors['text'], 'fontSize': '1.1em', 'fontWeight': 'bold'})
-    ])
 
 
 # CHANGE: Helper to build a stat row (label: value) used in sidebar panels
@@ -188,82 +199,6 @@ def generate_vol_signals(current_iv, current_hv, rvr, skew_ratio, term_slope):
     return signals
 
 
-def compute_dcf(ticker_symbol, growth_pct, wacc_pct, terminal_pct):
-    """5-year DCF model. Returns result dict or None on failure."""
-    try:
-        t = yf.Ticker(ticker_symbol)
-        info = t.info
-        fcf = info.get('freeCashflow')
-        if not fcf:
-            cf = t.cashflow
-            if cf is not None and not cf.empty:
-                for row in ['Free Cash Flow', 'Operating Cash Flow']:
-                    if row in cf.index:
-                        fcf = cf.loc[row].iloc[0]
-                        break
-        if not fcf or fcf <= 0:
-            return None
-
-        shares = info.get('sharesOutstanding') or 1
-        cash   = info.get('totalCash',  0) or 0
-        debt   = info.get('totalDebt',  0) or 0
-        price  = info.get('currentPrice') or info.get('regularMarketPrice')
-
-        g  = growth_pct   / 100
-        r  = wacc_pct     / 100
-        tg = terminal_pct / 100
-        if r <= tg:
-            return None  # model breaks if WACC ≤ terminal growth
-
-        proj = [fcf * (1 + g) ** yr for yr in range(1, 6)]
-        pv   = [f / (1 + r) ** yr   for yr, f in enumerate(proj, 1)]
-        tv   = proj[-1] * (1 + tg) / (r - tg)
-        pv_tv = tv / (1 + r) ** 5
-
-        ev          = sum(pv) + pv_tv
-        equity_val  = ev + cash - debt
-        intrinsic   = equity_val / shares
-
-        return {
-            'fcf': fcf, 'proj': proj, 'pv': pv,
-            'tv': tv, 'pv_tv': pv_tv, 'ev': ev,
-            'equity_val': equity_val, 'intrinsic': intrinsic,
-            'price': price, 'cash': cash, 'debt': debt,
-        }
-    except:
-        return None
-
-
-def get_comp_row(sym):
-    """Fetch key valuation + margin metrics for one ticker."""
-    try:
-        info = yf.Ticker(sym).info
-        mc = info.get('marketCap')
-        mc_str = (f"${mc/1e12:.2f}T" if mc and mc >= 1e12
-                  else f"${mc/1e9:.1f}B"  if mc and mc >= 1e9
-                  else f"${mc/1e6:.0f}M"  if mc
-                  else 'N/A')
-
-        def _f(v, pct=False):
-            if v is None: return 'N/A'
-            return f"{v*100:.1f}%" if pct else f"{v:.1f}"
-
-        price = info.get('currentPrice') or info.get('regularMarketPrice')
-        return {
-            'Ticker':    sym,
-            'Price':     f"${price:.2f}" if price else 'N/A',
-            'Mkt Cap':   mc_str,
-            'P/E':       _f(info.get('trailingPE')),
-            'Fwd P/E':   _f(info.get('forwardPE')),
-            'EV/EBITDA': _f(info.get('enterpriseToEbitda')),
-            'P/S':       _f(info.get('priceToSalesTrailingTwelveMonths')),
-            'P/B':       _f(info.get('priceToBook')),
-            'Rev Gr':    _f(info.get('revenueGrowth'), pct=True),
-            'Op Mgn':    _f(info.get('operatingMargins'), pct=True),
-            'ROE':       _f(info.get('returnOnEquity'), pct=True),
-        }
-    except:
-        return None
 
 
 def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key, as_of_date=None):
@@ -311,7 +246,7 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key, 
         # Use the as_of date (if historical) as reference for DTE calculation
         ref_date = datetime.date.fromisoformat(as_of_date) if is_historical else today
 
-        strikes, dtes, ivs, prices, deltas, volumes = [], [], [], [], [], []
+        strikes, dtes, ivs, prices, deltas, volumes, exps, ctypes = [], [], [], [], [], [], [], []
         expirations_seen = set()
 
         for c in contracts:
@@ -347,6 +282,8 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key, 
             ivs.append(iv)           # Polygon returns as decimal (0.25 = 25%)
             prices.append(opt_price)
             expirations_seen.add(exp_str)
+            exps.append(exp_str)
+            ctypes.append(c.details.contract_type if c.details.contract_type else 'unknown')
 
             deltas.append(abs(c.greeks.delta) if c.greeks and c.greeks.delta is not None else None)
             volumes.append(c.day.volume if c.day and c.day.volume else 0)
@@ -356,7 +293,7 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key, 
 
         return {
             "strikes": strikes, "dtes": dtes, "ivs": ivs, "prices": prices,
-            "deltas": deltas, "volumes": volumes,
+            "deltas": deltas, "volumes": volumes, "exps": exps, "ctypes": ctypes,
             "spot": spot,
             "contract_count": len(strikes),
             "exp_count": len(expirations_seen),
@@ -542,84 +479,6 @@ def make_empty_chart(message="Enter a ticker and click Analyze to get started.")
     return fig
 
 
-# --- 1. FUNDAMENTAL TAB LAYOUT ---
-fundamental_layout = html.Div([
-    html.Div(style=FLEX_WRAPPER_STYLE, children=[
-        html.Div(style=SIDEBAR_STYLE, children=[
-            html.H3("Stock Search", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Look up any ticker to view fundamentals, DCF valuation, and sector comparables.",
-                   className='helper-text', style={'marginTop': '0'}),
-
-            dcc.Input(id='fund-ticker-input', type='text', value=DEFAULT_TICKER,
-                      placeholder="Enter ticker (e.g. AAPL, MSFT, TSLA)", style=INPUT_STYLE),
-
-            html.Label("Lookback Period", style={'color': colors['text'], 'fontWeight': 'bold',
-                       'marginBottom': '10px', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '16px'}),
-            html.Div(style={'padding': '0 10px 20px 10px'}, children=[
-                dcc.Slider(id='fund-period-slider', min=0, max=6, step=1, value=2,
-                           marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: 'MAX'})
-            ]),
-
-            html.Hr(className='section-divider'),
-            html.Label("DCF Assumptions", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            html.Div("5-year FCF projection. Adjust growth, discount rate & terminal growth.",
-                     className='helper-text'),
-            html.Div(style={'display': 'grid', 'gridTemplateColumns': 'repeat(3, 1fr)', 'gap': '8px', 'marginBottom': '14px'}, children=[
-                html.Div([
-                    html.Div("Growth %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
-                    dcc.Input(id='fund-dcf-growth', type='number', value=10, min=0, max=50, step=0.5,
-                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
-                ]),
-                html.Div([
-                    html.Div("WACC %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
-                    dcc.Input(id='fund-dcf-wacc', type='number', value=10, min=1, max=30, step=0.5,
-                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
-                ]),
-                html.Div([
-                    html.Div("Term G %", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '4px'}),
-                    dcc.Input(id='fund-dcf-terminal', type='number', value=2.5, min=0, max=5, step=0.5,
-                              style={**INPUT_STYLE, 'textAlign': 'center', 'padding': '7px 4px'}),
-                ]),
-            ]),
-
-            html.Button('Analyze', id='fund-submit-btn', n_clicks=0, style=BUTTON_STYLE),
-            html.Hr(className='section-divider'),
-            html.Div(id='fund-info-display', children=html.Div([
-                html.P("Company info will appear here after search.",
-                       style={'color': colors['muted'], 'fontStyle': 'italic'})
-            ]))
-        ]),
-
-        html.Div(style=CONTENT_STYLE, children=[
-            dcc.Tabs(value='tab-fund-price',
-                     style={'marginBottom': '10px'},
-                     children=[
-                dcc.Tab(label='Price Chart', value='tab-fund-price',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
-                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
-                        children=[
-                            dcc.Loading(dcc.Graph(id='fund-price-chart',
-                                                  style={'height': '58vh', 'minHeight': '380px'}), type='circle')
-                        ]),
-                dcc.Tab(label='DCF Model', value='tab-fund-dcf',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
-                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
-                        children=[
-                            dcc.Loading(html.Div(id='fund-dcf-display', style={'padding': '12px'}), type='circle')
-                        ]),
-                dcc.Tab(label='Comparables', value='tab-fund-comps',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '10px'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'],
-                                        'borderTop': f"2px solid {colors['accent']}", 'padding': '10px'},
-                        children=[
-                            dcc.Loading(html.Div(id='fund-comps-display', style={'padding': '12px'}), type='circle')
-                        ]),
-            ]),
-        ])
-    ])
-])
 
 # --- 2. BLACK-SCHOLES TAB LAYOUT ---
 # CHANGE: Added helper text to each input explaining what the parameter means
@@ -772,26 +631,21 @@ vol_surface_layout = html.Div([
             html.H3("Vol Surface", style={'color': colors['accent'], 'marginBottom': '4px'}),
             html.P("Live implied volatility surface powered by Polygon.io.", className='helper-text', style={'marginTop': '0'}),
 
-            html.Label("Polygon.io API Key", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            html.Div("Get key at polygon.io · Starter plan required for options", className='helper-text'),
-            dcc.Input(id='vol-api-key-input', type='password', value=POLYGON_API_KEY,
-                      placeholder="paste your API key here",
-                      style={**INPUT_STYLE, 'marginBottom': '12px', 'fontFamily': 'monospace'}),
-
             html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
             dcc.Input(id='vol-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY, AAPL, TSLA",
                       style={**INPUT_STYLE, 'marginBottom': '12px'}),
 
             html.Label("Surface Date", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            html.Div("Today = live snapshot. Past date = historical (Business plan+).", className='helper-text'),
-            dcc.DatePickerSingle(
-                id='vol-date-picker',
-                date=datetime.date.today().isoformat(),
-                max_date_allowed=datetime.date.today().isoformat(),
-                min_date_allowed='2016-01-01',
-                display_format='YYYY-MM-DD',
-                style={'marginBottom': '12px', 'width': '100%'},
-            ),
+            html.Div("Drag to scrub through time. Today = live. Historical requires Business plan+.", className='helper-text'),
+            html.Div(id='vol-date-label', style={
+                'color': colors['accent'], 'fontWeight': 'bold', 'textAlign': 'center',
+                'fontSize': '0.9em', 'marginBottom': '6px', 'minHeight': '18px'
+            }),
+            html.Div(style={'padding': '0 8px 24px 8px'}, children=[
+                dcc.Slider(id='vol-date-slider', min=0, max=len(SURFACE_DATES) - 1, step=1,
+                           value=len(SURFACE_DATES) - 1, marks=SURFACE_MARKS,
+                           tooltip={"placement": "bottom", "always_visible": False}),
+            ]),
 
             html.Label("Contract Type", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
             dcc.RadioItems(
@@ -845,7 +699,28 @@ vol_surface_layout = html.Div([
             ]))
         ]),
         html.Div(style=CONTENT_STYLE, children=[
-            dcc.Loading(dcc.Graph(id='vol-surface-chart', style={'height': '70vh', 'minHeight': '500px'}), type='circle')
+            dcc.Store(id='vol-data-store'),
+            dcc.Store(id='vol-cache-store', data={}),
+            dcc.Tabs(id='vol-view-tabs', value='tab-surface', style={'marginBottom': '10px'}, children=[
+                dcc.Tab(label='3D Surface', value='tab-surface',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"},
+                        children=[
+                            dcc.Loading(dcc.Graph(id='vol-surface-chart', style={'height': '65vh', 'minHeight': '450px'}), type='circle'),
+                        ]),
+                dcc.Tab(label='Smile Slice', value='tab-smile',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"},
+                        children=[
+                            html.Div(style={'padding': '10px 12px 24px 12px'}, children=[
+                                html.Label("Expiry", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block', 'marginBottom': '2px'}),
+                                html.Div("Fetch surface first, then drag to select an expiration.", className='helper-text', style={'marginBottom': '14px'}),
+                                dcc.Slider(id='vol-smile-expiry', min=0, max=0, step=1, value=0, marks={},
+                                           tooltip={"placement": "bottom", "always_visible": False}),
+                            ]),
+                            dcc.Graph(id='vol-smile-chart', style={'height': '58vh', 'minHeight': '400px'}),
+                        ]),
+            ]),
         ])
     ])
 ])
@@ -928,13 +803,9 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
     ]),
 
     # Navigation Tabs
-    dcc.Tabs(id='main-tabs', value='tab-fundamental',
+    dcc.Tabs(id='main-tabs', value='tab-bs',
              style={'marginTop': '16px', 'marginBottom': '20px'},
              children=[
-                # CHANGE: Expanded tab labels for clarity (e.g. "Spread" -> "Spread Analysis")
-                dcc.Tab(label='Fundamentals', value='tab-fundamental',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Black-Scholes', value='tab-bs',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
@@ -952,8 +823,7 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
-    html.Div(id='fund-content-wrapper', children=fundamental_layout, style={'display': 'block'}),
-    html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
+    html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'block'}),
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
     html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'}),
@@ -977,295 +847,19 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 
 # Tab Visibility Toggle
 @app.callback(
-    [Output('fund-content-wrapper', 'style'), Output('bs-content-wrapper', 'style'),
+    [Output('bs-content-wrapper', 'style'),
      Output('spread-content-wrapper', 'style'), Output('vol-content-wrapper', 'style'),
      Output('va-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    fund_style, bs_style, spread_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 6
-    if tab_value == 'tab-fundamental': fund_style = {'display': 'block'}
-    elif tab_value == 'tab-bs': bs_style = {'display': 'block'}
+    bs_style, spread_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 5
+    if tab_value == 'tab-bs': bs_style = {'display': 'block'}
     elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
     elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
     elif tab_value == 'tab-va': va_style = {'display': 'block'}
     elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
-    return fund_style, bs_style, spread_style, vol_style, va_style, scanner_style
-
-# Main Fundamental Analysis Callback
-# CHANGE: Revamped the info display to use a grid of metric cards instead of plain text
-@app.callback(
-    [Output('fund-info-display', 'children'), Output('fund-price-chart', 'figure'),
-     Output('spot-input', 'value'), Output('spot-slider', 'value'),
-     Output('strike-input', 'value'), Output('strike-slider', 'value')],
-    [Input('fund-submit-btn', 'n_clicks'), Input('fund-ticker-input', 'value'),
-     Input('fund-period-slider', 'value')],
-    [State('fund-ticker-input', 'value')]
-)
-def update_fundamental_and_sync(n_clicks, input_val_trigger, period_slider_val, ticker_symbol):
-    if not ticker_symbol: return (no_update,) * 6
-
-    ticker_symbol = ticker_symbol.upper().strip()
-    selected_period = PERIOD_MAP.get(period_slider_val, '6mo')
-    period_labels = {0: '1 Month', 1: '3 Month', 2: '6 Month', 3: '1 Year', 4: '2 Year', 5: '5 Year', 6: 'Max'}
-    period_label = period_labels.get(period_slider_val, '6 Month')
-
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-        info = ticker.info
-        hist = ticker.history(period=selected_period)
-
-        peg = info.get('pegRatio')
-        pe = info.get('trailingPE')
-        peg_display = f"{peg:.2f}" if peg is not None else "N/A"
-        pe_display = f"{pe:.2f}" if pe is not None else "N/A"
-
-        # CHANGE: Format market cap into readable form (e.g. $1.5T, $230B)
-        market_cap = info.get('marketCap')
-        if market_cap:
-            if market_cap >= 1e12:
-                mc_display = f"${market_cap/1e12:.1f}T"
-            elif market_cap >= 1e9:
-                mc_display = f"${market_cap/1e9:.1f}B"
-            elif market_cap >= 1e6:
-                mc_display = f"${market_cap/1e6:.1f}M"
-            else:
-                mc_display = f"${market_cap:,.0f}"
-        else:
-            mc_display = "N/A"
-
-        beta = info.get('beta')
-        beta_display = f"{beta:.2f}" if beta is not None else "N/A"
-
-        div_yield = info.get('dividendYield')
-        div_display = f"{div_yield*100:.2f}%" if div_yield is not None else "N/A"
-
-        fifty_two_high = info.get('fiftyTwoWeekHigh')
-        fifty_two_low = info.get('fiftyTwoWeekLow')
-
-        # CHANGE: Redesigned info display with company name header + grid of metric cards
-        info_html = html.Div([
-            html.H2(f"{info.get('shortName', ticker_symbol)}", style={'marginTop': 0, 'marginBottom': '4px', 'color': colors['accent'], 'fontSize': '1.2em'}),
-            html.P(f"{info.get('sector', 'N/A')} / {info.get('industry', 'N/A')}",
-                   style={'color': colors['muted'], 'fontSize': '0.85em', 'marginTop': '0', 'marginBottom': '16px'}),
-
-            # CHANGE: Metric grid layout instead of stacked paragraphs
-            html.Div(style={'display': 'grid', 'gridTemplateColumns': 'repeat(2, 1fr)', 'gap': '10px'}, children=[
-                make_metric_card("Market Cap", mc_display),
-                make_metric_card("Beta", beta_display),
-                make_metric_card("P/E (TTM)", pe_display),
-                make_metric_card("PEG Ratio", peg_display),
-                make_metric_card("Div. Yield", div_display),
-                make_metric_card("52W High", f"${fifty_two_high:.2f}" if fifty_two_high else "N/A"),
-                make_metric_card("52W Low", f"${fifty_two_low:.2f}" if fifty_two_low else "N/A"),
-                # CHANGE: Added 52W Range bar showing where current price sits
-                html.Div(className='metric-card', children=[
-                    html.Div("52W Range", style={'color': colors['muted'], 'fontSize': '0.75em', 'marginBottom': '6px', 'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
-                    html.Div(style={'position': 'relative', 'height': '6px', 'backgroundColor': '#333', 'borderRadius': '3px', 'overflow': 'hidden'}, children=[
-                        html.Div(style={
-                            'position': 'absolute', 'left': '0', 'top': '0', 'height': '100%',
-                            'width': f"{((hist['Close'].iloc[-1] - fifty_two_low) / (fifty_two_high - fifty_two_low) * 100) if fifty_two_high and fifty_two_low and fifty_two_high != fifty_two_low else 50}%",
-                            'backgroundColor': colors['accent'], 'borderRadius': '3px'
-                        })
-                    ]) if fifty_two_high and fifty_two_low else html.Div("--", style={'color': colors['text']})
-                ])
-            ])
-        ])
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Close', line=dict(color=colors['accent'], width=2)))
-        # CHANGE: Added range fill beneath the line for visual clarity
-        fig.add_trace(go.Scatter(x=hist.index, y=hist['Close'], fill='tozeroy',
-                                 fillcolor='rgba(255, 102, 0, 0.08)', line=dict(width=0), showlegend=False, hoverinfo='skip'))
-        fig.update_layout(title=f"{ticker_symbol} - {period_label} History", yaxis_title="Price ($)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
-
-        if not hist.empty:
-            current_price = round(hist['Close'].iloc[-1], 2)
-            return info_html, fig, current_price, current_price, current_price, current_price
-
-        return info_html, fig, no_update, no_update, no_update, no_update
-
-    except Exception as e:
-        err = html.Div([
-            html.Div("Could not fetch data", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
-            html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
-        ])
-        return err, go.Figure(layout=layout_settings), no_update, no_update, no_update, no_update
-
-# --- DCF CALLBACK ---
-@app.callback(
-    Output('fund-dcf-display', 'children'),
-    [Input('fund-submit-btn', 'n_clicks'),
-     Input('fund-dcf-growth', 'value'),
-     Input('fund-dcf-wacc', 'value'),
-     Input('fund-dcf-terminal', 'value')],
-    [State('fund-ticker-input', 'value')],
-    prevent_initial_call=True
-)
-def update_fund_dcf(_n_clicks, growth, wacc, terminal, ticker_symbol):
-    if not ticker_symbol:
-        return html.P("Enter a ticker and click Analyze.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-    growth   = growth   or 10
-    wacc     = wacc     or 10
-    terminal = terminal or 2.5
-    sym = ticker_symbol.strip().upper()
-    result = compute_dcf(sym, growth, wacc, terminal)
-    if not result:
-        return html.Div([
-            html.P(f"DCF could not be computed for {sym}.",
-                   style={'color': colors['danger'], 'fontWeight': 'bold'}),
-            html.P("This is common for financials, REITs, or companies with negative FCF.",
-                   style={'color': colors['muted'], 'fontSize': '0.85em'}),
-        ])
-
-    intrinsic = result['intrinsic']
-    price     = result['price']
-    upside    = ((intrinsic - price) / price * 100) if price else None
-    upside_color = colors['call_text'] if upside and upside > 0 else colors['put_text']
-    upside_str = f"{upside:+.1f}%" if upside is not None else 'N/A'
-
-    def _bn(v):
-        """Format large dollar values into B/M."""
-        if abs(v) >= 1e9:  return f"${v/1e9:.2f}B"
-        if abs(v) >= 1e6:  return f"${v/1e6:.1f}M"
-        return f"${v:,.0f}"
-
-    # --- Summary cards ---
-    summary = html.Div(style={'display': 'flex', 'gap': '10px', 'marginBottom': '16px', 'flexWrap': 'wrap'}, children=[
-        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
-            html.Div("Intrinsic Value", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
-            html.Div(f"${intrinsic:.2f}", style={'color': colors['accent'], 'fontWeight': 'bold', 'fontSize': '1.3em'}),
-        ]),
-        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
-            html.Div("Current Price", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
-            html.Div(f"${price:.2f}" if price else 'N/A', style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1.3em'}),
-        ]),
-        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
-            html.Div("Upside / Downside", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
-            html.Div(upside_str, style={'color': upside_color, 'fontWeight': 'bold', 'fontSize': '1.3em'}),
-        ]),
-        html.Div(className='metric-card', style={'flex': '1 1 110px', 'textAlign': 'center'}, children=[
-            html.Div("Enterprise Value", style={'color': colors['muted'], 'fontSize': '0.72em', 'textTransform': 'uppercase'}),
-            html.Div(_bn(result['ev']), style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1.1em'}),
-        ]),
-    ])
-
-    # --- Projected FCF table ---
-    years = [f"Year {i}" for i in range(1, 6)]
-    table_rows = [
-        html.Tr([html.Th("", style={'color': colors['muted'], 'padding': '6px 10px', 'textAlign': 'left'})]
-                + [html.Th(y, style={'color': colors['muted'], 'padding': '6px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for y in years],
-                style={'borderBottom': f"1px solid {colors['card_border']}"}),
-        html.Tr([html.Td("Projected FCF", style={'color': colors['text'], 'padding': '5px 10px', 'fontSize': '0.85em'})]
-                + [html.Td(_bn(v), style={'color': colors['accent'], 'padding': '5px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for v in result['proj']]),
-        html.Tr([html.Td("PV of FCF", style={'color': colors['text'], 'padding': '5px 10px', 'fontSize': '0.85em'})]
-                + [html.Td(_bn(v), style={'color': colors['call_text'], 'padding': '5px 10px', 'textAlign': 'right', 'fontSize': '0.85em'}) for v in result['pv']]),
-    ]
-    proj_table = html.Div([
-        html.Div("5-Year FCF Projection", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '6px', 'fontSize': '0.9em'}),
-        html.Div(style={'overflowX': 'auto'}, children=[
-            html.Table(table_rows, style={'width': '100%', 'borderCollapse': 'collapse',
-                                          'backgroundColor': colors['card_bg'], 'borderRadius': '6px'})
-        ]),
-    ], style={'marginBottom': '14px'})
-
-    # --- Value bridge ---
-    bridge = html.Div([
-        html.Div("Valuation Bridge", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '8px', 'fontSize': '0.9em'}),
-        html.Div(style={'display': 'flex', 'gap': '8px', 'flexWrap': 'wrap'}, children=[
-            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
-                html.Div("PV of FCFs",     style={'color': colors['muted'], 'fontSize': '0.78em'}),
-                html.Div(_bn(sum(result['pv'])), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
-            ]),
-            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
-                html.Div("PV Terminal Val", style={'color': colors['muted'], 'fontSize': '0.78em'}),
-                html.Div(_bn(result['pv_tv']), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
-            ]),
-            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
-                html.Div("+ Cash",  style={'color': colors['muted'], 'fontSize': '0.78em'}),
-                html.Div(_bn(result['cash']), style={'color': colors['call_text'], 'fontWeight': 'bold'}),
-            ]),
-            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
-                html.Div("− Debt",  style={'color': colors['muted'], 'fontSize': '0.78em'}),
-                html.Div(_bn(result['debt']), style={'color': colors['put_text'], 'fontWeight': 'bold'}),
-            ]),
-            html.Div(className='stat-card', style={'flex': '1 1 130px'}, children=[
-                html.Div("Equity Value", style={'color': colors['muted'], 'fontSize': '0.78em'}),
-                html.Div(_bn(result['equity_val']), style={'color': colors['accent'], 'fontWeight': 'bold'}),
-            ]),
-        ])
-    ])
-
-    return html.Div([summary, proj_table, bridge])
-
-
-# --- COMPS CALLBACK ---
-@app.callback(
-    Output('fund-comps-display', 'children'),
-    [Input('fund-submit-btn', 'n_clicks')],
-    [State('fund-ticker-input', 'value')],
-    prevent_initial_call=True
-)
-def update_fund_comps(_n, ticker_symbol):
-    if not ticker_symbol:
-        return html.P("Enter a ticker and click Analyze.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-    sym = ticker_symbol.strip().upper()
-    try:
-        sector = yf.Ticker(sym).info.get('sector', '')
-    except:
-        sector = ''
-
-    peer_pool = SECTOR_PEERS.get(sector, [])
-    peers = [p for p in peer_pool if p != sym][:6]
-    all_syms = [sym] + peers
-
-    rows = [r for r in (get_comp_row(s) for s in all_syms) if r]
-    if not rows:
-        return html.P("Could not fetch comparables data.", style={'color': colors['danger']})
-
-    col_order = ['Ticker', 'Price', 'Mkt Cap', 'P/E', 'Fwd P/E', 'EV/EBITDA', 'P/S', 'P/B', 'Rev Gr', 'Op Mgn', 'ROE']
-    header_tips = {
-        'P/E':       'Price-to-Earnings (trailing 12 months)',
-        'Fwd P/E':   'Price-to-Earnings (next 12 months analyst estimate)',
-        'EV/EBITDA': 'Enterprise Value ÷ EBITDA',
-        'P/S':       'Price-to-Sales (trailing 12 months)',
-        'P/B':       'Price-to-Book Value',
-        'Rev Gr':    'Revenue growth year-over-year',
-        'Op Mgn':    'Operating margin (EBIT ÷ Revenue)',
-        'ROE':       'Return on Equity',
-    }
-
-    table = dash_table.DataTable(
-        data=rows,
-        columns=[{'name': c, 'id': c} for c in col_order],
-        style_table={'overflowX': 'auto'},
-        style_header={
-            'backgroundColor': '#1a1a1a', 'color': colors['accent'],
-            'fontWeight': 'bold', 'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
-        },
-        style_cell={
-            'backgroundColor': colors['card_bg'], 'color': colors['text'],
-            'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
-            'padding': '9px 12px', 'fontFamily': "'Segoe UI', Arial, sans-serif", 'fontSize': '0.88em',
-        },
-        style_data_conditional=[
-            {'if': {'filter_query': f'{{Ticker}} = "{sym}"'}, 'backgroundColor': '#0d0d20', 'fontWeight': 'bold'},
-            {'if': {'column_id': 'Ticker'}, 'color': colors['accent'], 'fontWeight': 'bold'},
-        ],
-        tooltip_header=header_tips,
-        tooltip_delay=0, tooltip_duration=None,
-        sort_action='native',
-    )
-
-    sector_label = f" — {sector}" if sector else ""
-    return html.Div([
-        html.Div(f"{sym} vs Sector Peers{sector_label}",
-                 style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '10px', 'fontSize': '0.9em'}),
-        html.Div(f"Subject company ({sym}) highlighted. Hover column headers for definitions.",
-                 className='helper-text', style={'marginBottom': '10px'}),
-        table,
-    ])
-
+    return bs_style, spread_style, vol_style, va_style, scanner_style
 
 # --- SPREAD ANALYSIS CALLBACK ---
 # CHANGE: Added z-score to stats, colored stat values, improved stat card layout
@@ -1294,7 +888,8 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
         fig_norm = go.Figure()
         fig_norm.add_trace(go.Scatter(x=df.index, y=norm_a, mode='lines', name=f"{ticker_a}", line=dict(color=colors['accent'], width=2)))
         fig_norm.add_trace(go.Scatter(x=df.index, y=norm_b, mode='lines', name=f"{ticker_b}", line=dict(color=colors['put_text'], width=2)))
-        fig_norm.update_layout(title=f"Relative Performance - {selected_period.upper()}", yaxis_title="Normalized Price (100 = Start)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+        fig_norm.update_layout(title=f"Relative Performance - {selected_period.upper()}", yaxis_title="Normalized Price (100 = Start)", margin=dict(l=20, r=20, t=40, b=20),
+                               uirevision=f"{ticker_a}-{ticker_b}", transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
 
         ratio = df[ticker_a] / df[ticker_b]
         fig_ratio = go.Figure()
@@ -1303,7 +898,8 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
         # CHANGE: Added +/- 1 std dev bands to ratio chart for mean-reversion context
         fig_ratio.add_hline(y=ratio.mean() + ratio.std(), line_dash="dot", line_color=colors['call_text'], annotation_text="+1σ")
         fig_ratio.add_hline(y=ratio.mean() - ratio.std(), line_dash="dot", line_color=colors['put_text'], annotation_text="-1σ")
-        fig_ratio.update_layout(title=f"Ratio ({ticker_a} / {ticker_b})", yaxis_title="Ratio", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+        fig_ratio.update_layout(title=f"Ratio ({ticker_a} / {ticker_b})", yaxis_title="Ratio", margin=dict(l=20, r=20, t=40, b=20),
+                               uirevision=f"{ticker_a}-{ticker_b}-ratio", transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
 
         corr = df[ticker_a].corr(df[ticker_b])
         curr_ratio = ratio.iloc[-1]
@@ -1343,73 +939,38 @@ def update_spread_analysis(n_clicks, ticker_a, ticker_b, slider_val):
         ])
 
 # --- VOLATILITY SURFACE CALLBACK (Polygon.io) ---
-@app.callback(
-    [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children')],
-    [Input('vol-submit-btn', 'n_clicks')],
-    [State('vol-ticker-input', 'value'),
-     State('vol-api-key-input', 'value'),
-     State('vol-date-picker', 'date'),
-     State('vol-contract-type', 'value'),
-     State('vol-moneyness-slider', 'value'),
-     State('vol-z-axis', 'value'),
-     State('vol-plot-type', 'value')],
-    prevent_initial_call=True
-)
-def update_vol_surface(_n, ticker_symbol, api_key, as_of_date, contract_type, moneyness_slider, z_axis, plot_type):
-    empty_fig = go.Figure(layout=layout_settings)
-    if not ticker_symbol:
-        return empty_fig, html.Div()
-
-    sym = ticker_symbol.upper().strip()
-    moneyness_pct = (moneyness_slider or 25) / 100
-
-    data, err = fetch_polygon_surface(sym, contract_type, moneyness_pct, api_key, as_of_date=as_of_date)
-    if err:
-        info = html.Div([
-            html.Div("Data fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
-            html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
-        ])
-        return empty_fig, info
-
-    strikes = data['strikes']
-    dtes    = data['dtes']
-    ivs     = data['ivs']
+# Slider is a State — only the Fetch button fires an API call.
+# Results are cached per (ticker, date, contract_type, moneyness) so re-visiting
+# a previously fetched date is instant with zero additional API calls.
+def _build_surface_figure(data, sym, as_of_date, contract_type, z_axis, plot_type, moneyness_pct):
+    """Render a surface/scatter figure from a cached data dict. Returns (fig, info_html, smile_marks, smile_max)."""
+    strikes    = data['strikes']
+    dtes       = data['dtes']
+    ivs        = data['ivs']
     raw_prices = data['prices']
-    spot    = data['spot']
+    spot       = data['spot']
 
     min_strike, max_strike = min(strikes), max(strikes)
     min_dte,    max_dte    = min(dtes),    max(dtes)
 
-    # Choose Z values and axis labels based on selector
     use_price = (z_axis == 'price')
     if use_price:
-        # Drop points without a valid price
         valid = [(s, d, p) for s, d, p in zip(strikes, dtes, raw_prices) if p is not None]
         if len(valid) < 5:
-            return empty_fig, html.Div(
-                "Not enough contracts with valid price quotes. Try IV (%) instead.",
-                style={'color': colors['danger'], 'fontSize': '0.9em'}
-            )
+            return None, "not_enough_price", None, None
         z_strikes, z_dtes, z_vals = zip(*valid)
         z_strikes, z_dtes, z_vals = list(z_strikes), list(z_dtes), list(z_vals)
-        z_label      = "Price ($)"
-        z_tickprefix = "$"
-        z_ticksuffix = ""
-        hover_z      = "$%{z:.2f}"
+        z_label, z_tickprefix, z_ticksuffix, hover_z = "Price ($)", "$", "", "$%{z:.2f}"
     else:
         z_strikes, z_dtes = strikes, dtes
-        z_vals = [v * 100 for v in ivs]   # decimal → percent
-        z_label      = "IV (%)"
-        z_tickprefix = ""
-        z_ticksuffix = "%"
-        hover_z      = "%{z:.1f}%"
+        z_vals = [v * 100 for v in ivs]
+        z_label, z_tickprefix, z_ticksuffix, hover_z = "IV (%)", "", "%", "%{z:.1f}%"
 
-    ct_label  = {'call': 'Call', 'put': 'Put', 'both': 'Call + Put'}.get(contract_type, '')
-    z_display = "Option Price" if use_price else "Implied Vol"
+    ct_label   = {'call': 'Call', 'put': 'Put', 'both': 'Call + Put'}.get(contract_type, '')
+    z_display  = "Option Price" if use_price else "Implied Vol"
     spot_label = f"  Spot: ${spot:.2f}" if spot else ""
 
     fig = go.Figure()
-
     if plot_type == 'surface':
         sg = np.linspace(min(z_strikes), max(z_strikes), 50)
         dg = np.linspace(min(z_dtes),    max(z_dtes),    50)
@@ -1418,42 +979,41 @@ def update_vol_surface(_n, ticker_symbol, api_key, as_of_date, contract_type, mo
         if np.isnan(Z).all():
             Z = griddata((z_strikes, z_dtes), z_vals, (X, Y), method='linear')
         fig.add_trace(go.Surface(
-            z=Z, x=X, y=Y,
-            colorscale='Jet',
+            z=Z, x=X, y=Y, colorscale='Jet',
             colorbar=dict(title=z_label, tickprefix=z_tickprefix, ticksuffix=z_ticksuffix),
             hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
         ))
     else:
         fig.add_trace(go.Scatter3d(
-            x=z_strikes, y=z_dtes, z=z_vals,
-            mode='markers',
+            x=z_strikes, y=z_dtes, z=z_vals, mode='markers',
             marker=dict(size=3, color=z_vals, colorscale='Jet', opacity=0.85,
                         colorbar=dict(title=z_label, tickprefix=z_tickprefix, ticksuffix=z_ticksuffix)),
             hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
             name=z_display,
         ))
 
+    today_str = datetime.date.today().isoformat()
     fig.update_layout(
         title=f"{sym} {ct_label} {z_display} Surface — {as_of_date or 'Live'}{spot_label}",
         scene=dict(
             camera=dict(up=dict(x=0,y=0,z=1), center=dict(x=0,y=0,z=0), eye=dict(x=-1.8,y=-1.2,z=1.0)),
-            xaxis_title='Strike ($)',
-            yaxis_title='DTE (days)',
-            zaxis_title=z_label,
+            xaxis_title='Strike ($)', yaxis_title='DTE (days)', zaxis_title=z_label,
             xaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
             yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
             zaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
+        uirevision=f"{sym}-{as_of_date}",
         **layout_settings
     )
 
-    iv_pcts = [v * 100 for v in ivs]
+    iv_pcts    = [v * 100 for v in ivs]
     price_vals = [p for p in raw_prices if p is not None]
+    source_str = "Polygon.io — Historical" if as_of_date and as_of_date != today_str else "Polygon.io — Live"
     info_html = html.Div([
         html.H4("Surface Data · Polygon.io", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-        make_stat_row("Source",  "Polygon.io — Historical" if as_of_date and as_of_date != datetime.date.today().isoformat() else "Polygon.io — Live"),
-        make_stat_row("Date",    as_of_date or datetime.date.today().isoformat()),
+        make_stat_row("Source",       source_str),
+        make_stat_row("Date",         as_of_date or today_str),
         make_stat_row("Spot Price",   f"${spot:.2f}" if spot else "N/A", colors['accent']),
         make_stat_row("Contracts",    f"{data['contract_count']:,}"),
         make_stat_row("Expirations",  f"{data['exp_count']}"),
@@ -1464,7 +1024,206 @@ def update_vol_surface(_n, ticker_symbol, api_key, as_of_date, contract_type, mo
         make_stat_row("Moneyness",    f"±{int(moneyness_pct*100)}% of spot"),
     ])
 
-    return fig, info_html
+    sorted_exps = sorted(set(data['exps']))
+    data['sorted_exps'] = sorted_exps
+
+    def fmt_exp(e):
+        try:    return datetime.date.fromisoformat(e).strftime("%b %d")
+        except: return e
+
+    smile_marks = {i: {'label': fmt_exp(e), 'style': {'color': '#aaa', 'fontSize': '10px'}}
+                   for i, e in enumerate(sorted_exps)}
+    return fig, info_html, smile_marks, max(0, len(sorted_exps) - 1)
+
+
+@app.callback(
+    [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children'),
+     Output('vol-data-store', 'data'), Output('vol-smile-expiry', 'marks'),
+     Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value'),
+     Output('vol-cache-store', 'data')],
+    [Input('vol-submit-btn', 'n_clicks'), Input('vol-date-slider', 'value')],
+    [State('vol-ticker-input', 'value'),
+     State('vol-contract-type', 'value'),
+     State('vol-moneyness-slider', 'value'),
+     State('vol-z-axis', 'value'),
+     State('vol-plot-type', 'value'),
+     State('vol-cache-store', 'data')],
+    prevent_initial_call=True
+)
+def update_vol_surface(_n, date_idx, ticker_symbol, contract_type, moneyness_slider, z_axis, plot_type, cache):
+    today_str    = datetime.date.today().isoformat()
+    as_of_date   = SURFACE_DATES[date_idx] if date_idx is not None and date_idx < len(SURFACE_DATES) else today_str
+    cache        = cache or {}
+    empty_fig    = go.Figure(layout=layout_settings)
+    triggered_by_slider = ctx.triggered_id == 'vol-date-slider'
+
+    if not ticker_symbol:
+        return empty_fig, html.Div(), no_update, no_update, no_update, no_update, no_update
+
+    sym          = ticker_symbol.upper().strip()
+    moneyness_pct = (moneyness_slider or 25) / 100
+    cache_key    = f"{sym}|{as_of_date}|{contract_type}|{int(moneyness_slider or 25)}"
+
+    # ── Slider moved: serve from cache only, never hit the API ──────────────
+    if triggered_by_slider:
+        if cache_key not in cache:
+            msg = html.Div(
+                f"No data cached for {as_of_date}. Click 'Fetch Surface' to load.",
+                style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '10px'}
+            )
+            return empty_fig, msg, no_update, no_update, no_update, no_update, no_update
+        data = cache[cache_key]
+        fig, info_html, smile_marks, smile_max = _build_surface_figure(
+            data, sym, as_of_date, contract_type, z_axis, plot_type, moneyness_pct)
+        if fig is None:
+            return empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
+                                       style={'color': colors['danger']}), \
+                   no_update, no_update, no_update, no_update, no_update
+        return fig, info_html, data, smile_marks, smile_max, 0, no_update
+
+    # ── Button clicked: check cache first, fetch from Polygon if missed ─────
+    if cache_key in cache:
+        data = cache[cache_key]
+    else:
+        data, err = fetch_polygon_surface(sym, contract_type, moneyness_pct, POLYGON_API_KEY, as_of_date=as_of_date)
+        if err:
+            info = html.Div([
+                html.Div("Data fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
+                html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
+            ])
+            return empty_fig, info, no_update, no_update, no_update, no_update, cache
+        cache = {**cache, cache_key: data}   # store in cache (immutable copy)
+
+    fig, info_html, smile_marks, smile_max = _build_surface_figure(
+        data, sym, as_of_date, contract_type, z_axis, plot_type, moneyness_pct)
+    if fig is None:
+        return empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
+                                   style={'color': colors['danger']}), \
+               no_update, no_update, no_update, no_update, cache
+    return fig, info_html, data, smile_marks, smile_max, 0, cache
+
+
+# --- VOL DATE LABEL (live drag feedback + cache status, zero API calls) ---
+@app.callback(
+    Output('vol-date-label', 'children'),
+    [Input('vol-date-slider', 'drag_value'), Input('vol-date-slider', 'value'),
+     Input('vol-cache-store', 'data')],
+    [State('vol-ticker-input', 'value'),
+     State('vol-contract-type', 'value'),
+     State('vol-moneyness-slider', 'value')],
+)
+def update_vol_date_label(drag_idx, value_idx, cache, ticker, contract_type, moneyness_slider):
+    idx = drag_idx if drag_idx is not None else value_idx
+    if idx is None:
+        return ""
+    idx      = min(int(idx), len(SURFACE_DATES) - 1)
+    date_str = SURFACE_DATES[idx]
+    cache    = cache or {}
+    sym      = (ticker or '').upper().strip()
+    cache_key = f"{sym}|{date_str}|{contract_type}|{int(moneyness_slider or 25)}"
+
+    today_str = datetime.date.today().isoformat()
+    if date_str == today_str:
+        label, color = f"{date_str}  —  Live", colors['accent']
+    elif cache_key in cache:
+        label, color = f"{date_str}  —  Cached ✓", colors['call_text']
+    else:
+        label, color = f"{date_str}  —  Click Fetch to load", colors['muted']
+    return html.Span(label, style={'color': color})
+
+
+# --- VOL SMILE SLICE CALLBACK ---
+@app.callback(
+    Output('vol-smile-chart', 'figure'),
+    [Input('vol-smile-expiry', 'drag_value'), Input('vol-smile-expiry', 'value'), Input('vol-data-store', 'data')],
+    State('vol-z-axis', 'value'),
+)
+def update_vol_smile(drag_idx, value_idx, store_data, z_axis):
+    selected_idx = drag_idx if drag_idx is not None else value_idx
+    empty_fig = go.Figure(layout=layout_settings)
+    if not store_data or selected_idx is None or 'sorted_exps' not in store_data:
+        empty_fig.update_layout(annotations=[dict(
+            text="Fetch the surface first, then drag the expiry slider.",
+            xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14, color=colors['muted'])
+        )])
+        return empty_fig
+
+    sorted_exps = store_data['sorted_exps']
+    if selected_idx >= len(sorted_exps):
+        return empty_fig
+    selected_exp = sorted_exps[selected_idx]
+
+    use_price = (z_axis == 'price')
+    y_label   = "Option Price ($)" if use_price else "Implied Volatility (%)"
+    y_prefix  = "$" if use_price else ""
+    y_suffix  = ""  if use_price else "%"
+
+    spot    = store_data.get('spot')
+    strikes = store_data['strikes']
+    ivs     = store_data['ivs']
+    prices  = store_data['prices']
+    exps    = store_data['exps']
+    ctypes  = store_data['ctypes']
+
+    # Compute global axis ranges across ALL expiries so axes stay fixed while scrubbing
+    all_y = []
+    for iv, p in zip(ivs, prices):
+        v = p if use_price else iv * 100
+        if v is not None:
+            all_y.append(v)
+
+    x_pad = (max(strikes) - min(strikes)) * 0.04 if strikes else 1
+    y_pad = (max(all_y)   - min(all_y))   * 0.06 if all_y   else 1
+    x_range = [min(strikes) - x_pad, max(strikes) + x_pad]
+    y_range = [max(0, min(all_y) - y_pad), max(all_y) + y_pad]
+
+    # Filter to selected expiry
+    call_strikes, call_y = [], []
+    put_strikes,  put_y  = [], []
+
+    for s, iv, p, exp, ct in zip(strikes, ivs, prices, exps, ctypes):
+        if exp != selected_exp:
+            continue
+        y_val = p if use_price else iv * 100
+        if y_val is None:
+            continue
+        if ct == 'call':
+            call_strikes.append(s); call_y.append(y_val)
+        elif ct == 'put':
+            put_strikes.append(s);  put_y.append(y_val)
+        else:
+            call_strikes.append(s); call_y.append(y_val)
+
+    fig = go.Figure()
+    if call_strikes:
+        pairs = sorted(zip(call_strikes, call_y))
+        sc, yc = zip(*pairs)
+        fig.add_trace(go.Scatter(x=list(sc), y=list(yc), mode='lines+markers',
+                                 name='Calls', line=dict(color=colors['call_text'], width=2),
+                                 marker=dict(size=5)))
+    if put_strikes:
+        pairs = sorted(zip(put_strikes, put_y))
+        sp, yp = zip(*pairs)
+        fig.add_trace(go.Scatter(x=list(sp), y=list(yp), mode='lines+markers',
+                                 name='Puts', line=dict(color=colors['put_text'], width=2),
+                                 marker=dict(size=5)))
+
+    if spot:
+        fig.add_vline(x=spot, line_width=1, line_dash='dash', line_color='#666',
+                      annotation_text=f'Spot ${spot:.2f}', annotation_font_color='#aaa')
+
+    fig.update_layout(
+        title=f"Volatility Smile — Expiry {selected_exp}",
+        xaxis=dict(title="Strike ($)", range=x_range),
+        yaxis=dict(title=y_label, range=y_range, tickprefix=y_prefix, ticksuffix=y_suffix),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        margin=dict(l=20, r=20, t=60, b=40),
+        uirevision='smile',
+        transition=dict(duration=100, easing='cubic-in-out'),
+        **layout_settings,
+    )
+    return fig
 
 
 # --- VOLATILITY ANALYTICS CALLBACK ---
@@ -1523,7 +1282,8 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
             fig_skew.add_trace(go.Scatter(x=calls_skew['strike'], y=calls_skew['impliedVolatility']*100, mode='lines+markers', name='Calls IV', line=dict(color=colors['call_text'])))
             fig_skew.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="#666", annotation_text="Spot")
 
-            fig_skew.update_layout(title=f"Live Volatility Skew (Expiry: {target_exp})", xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility (%)", margin=dict(l=20, r=20, t=40, b=20), **layout_settings)
+            fig_skew.update_layout(title=f"Live Volatility Skew (Expiry: {target_exp})", xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility (%)", margin=dict(l=20, r=20, t=40, b=20),
+                                   uirevision=ticker_symbol, transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
 
             otm_put_target = spot_price * 0.90
             closest_put = puts.iloc[(puts['strike'] - otm_put_target).abs().argsort()[:1]]
@@ -1550,14 +1310,15 @@ def update_vol_analytics(n_clicks, ticker_symbol, window):
         else:
             skew_ratio_num = None
             term_slope = None
-            fig_skew.update_layout(title="No Options Data Available for Skew", **layout_settings)
+            fig_skew.update_layout(title="No Options Data Available for Skew", uirevision=ticker_symbol, **layout_settings)
 
         fig_hv = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
                             row_heights=[0.6, 0.4], subplot_titles=(f"{ticker_symbol} Price", f"{window}-Day Rolling Historical Volatility (HV)"))
         fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Price', line=dict(color=colors['accent'], width=2)), row=1, col=1)
         fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['HV'], mode='lines', name=f'{window}d HV', line=dict(color=colors['put_text'], width=2)), row=2, col=1)
 
-        fig_hv.update_layout(margin=dict(l=20, r=20, t=40, b=20), showlegend=False, **layout_settings)
+        fig_hv.update_layout(margin=dict(l=20, r=20, t=40, b=20), showlegend=False,
+                             uirevision=ticker_symbol, transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
         fig_hv.update_yaxes(title_text="Price ($)", row=1, col=1)
         fig_hv.update_yaxes(title_text="Volatility (%)", row=2, col=1)
 
