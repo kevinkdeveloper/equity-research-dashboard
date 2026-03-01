@@ -803,10 +803,10 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
     ]),
 
     # Navigation Tabs
-    dcc.Tabs(id='main-tabs', value='tab-bs',
+    dcc.Tabs(id='main-tabs', value='tab-scanner',
              style={'marginTop': '16px', 'marginBottom': '20px'},
              children=[
-                dcc.Tab(label='Black-Scholes', value='tab-bs',
+                dcc.Tab(label='Scanner', value='tab-scanner',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
                 dcc.Tab(label='Spread Analysis', value='tab-spread',
@@ -818,16 +818,16 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Vol Analytics', value='tab-va',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
-                dcc.Tab(label='Scanner', value='tab-scanner',
+                dcc.Tab(label='Black-Scholes', value='tab-bs',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
-    html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'block'}),
+    html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
     html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'}),
-    html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'none'}),
+    html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'block'}),
 
     # CHANGE: Added footer with context so the app feels polished
     html.Div(style={
