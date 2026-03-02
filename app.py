@@ -1619,6 +1619,15 @@ def run_scanner(n_clicks, tickers_raw):
                 cell_styles.append({'if': {'row_index': i, 'column_id': 'Skew'}, 'backgroundColor': bg, 'color': '#111'})
             except Exception:
                 pass
+        pc_str = row.get('P/C Vol', 'N/A')
+        if pc_str != 'N/A':
+            try:
+                val = float(pc_str)
+                t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
+                bg = pc.sample_colorscale('RdYlGn', [t])[0]
+                cell_styles.append({'if': {'row_index': i, 'column_id': 'P/C Vol'}, 'backgroundColor': bg, 'color': '#111'})
+            except Exception:
+                pass
         t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
         bg_bias = pc.sample_colorscale('RdYlGn', [t_bias])[0]
         cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'}, 'backgroundColor': bg_bias, 'color': '#111', 'fontWeight': 'bold'})
