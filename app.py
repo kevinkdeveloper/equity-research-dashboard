@@ -1,7 +1,9 @@
 import os
+import concurrent.futures
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update, dash_table
 import plotly.graph_objects as go
+import plotly.colors as pc
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.stats import norm
@@ -26,7 +28,7 @@ DEFAULT_VOL = 0.2
 DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
-DEFAULT_SCANNER_TICKERS = "SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, GLD, SLV, TLT"
+DEFAULT_SCANNER_TICKERS = "SPY, QQQ, GLD, SLV, TLT"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'qvG5Nf6OFdw8Od7oMVeUo7B0q3lB0zbo')
 
 # --- Historical vol-surface date slider: weekly steps for the past ~2 years ---
@@ -266,50 +268,86 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key):
 
 
 def scan_ticker(ticker_symbol):
-    """Fetch vol metrics for one ticker and return a table row dict."""
+    """Fetch vol metrics for one ticker using Polygon.io and return a table row dict."""
+    if not POLYGON_AVAILABLE or not POLYGON_API_KEY:
+        return None
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        hist = ticker.history(period="1y")
-        if hist.empty or len(hist) < 30:
+        client = PolygonClient(api_key=POLYGON_API_KEY)
+        today = datetime.date.today()
+        from_date = today - datetime.timedelta(days=365)
+
+        # --- Historical daily closes for HV ---
+        aggs = list(client.list_aggs(
+            ticker_symbol.upper(), 1, 'day',
+            from_date.isoformat(), today.isoformat(),
+            adjusted=True, sort='asc', limit=365
+        ))
+        if len(aggs) < 31:
             return None
-        hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
-        hist['HV'] = hist['Log_Ret'].rolling(window=30).std() * np.sqrt(252) * 100
-        hist = hist.dropna()
-        current_hv = hist['HV'].iloc[-1]
-        hv_rank = ((current_hv - hist['HV'].min()) / (hist['HV'].max() - hist['HV'].min())) * 100
 
+        closes = np.array([a.close for a in aggs])
+        log_rets = np.log(closes[1:] / closes[:-1])
+        hv_series = [np.std(log_rets[i - 29:i + 1], ddof=1) * np.sqrt(252) * 100
+                     for i in range(29, len(log_rets))]
+        current_hv = hv_series[-1]
+        hv_min, hv_max = min(hv_series), max(hv_series)
+        hv_rank = ((current_hv - hv_min) / (hv_max - hv_min) * 100) if hv_max > hv_min else 50.0
+        spot = closes[-1]
+
+        # --- Options chain snapshot ---
         current_iv, skew_ratio, pc_vol_ratio = None, None, None
-        options = ticker.options
-        if options:
-            today = datetime.datetime.now().date()
-            valid = [e for e in options if (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 7]
-            exp = valid[0] if valid else options[0]
-            chain = ticker.option_chain(exp)
-            spot = hist['Close'].iloc[-1]
+        try:
+            contracts = list(client.list_snapshot_options_chain(
+                ticker_symbol.upper(), params={'limit': 250}
+            ))
+        except Exception:
+            contracts = []
 
-            # ATM IV (calls)
-            atm = chain.calls.iloc[(chain.calls['strike'] - spot).abs().argsort()[:1]]
-            if not atm.empty:
-                current_iv = atm['impliedVolatility'].values[0] * 100
+        if contracts:
+            # Use spot from options chain if available (more current than last close)
+            for c in contracts:
+                if c.underlying_asset and c.underlying_asset.price:
+                    spot = c.underlying_asset.price
+                    break
 
-            # Put skew: 90% strike vs ATM call IV
-            closest_put = chain.puts.iloc[(chain.puts['strike'] - spot * 0.90).abs().argsort()[:1]]
-            if not closest_put.empty and current_iv:
-                skew_ratio = closest_put['impliedVolatility'].values[0] * 100 / current_iv
+            # Find nearest expiry >= 7 days out
+            valid_exps = sorted({
+                c.details.expiration_date for c in contracts
+                if c.details and c.details.expiration_date
+                and (datetime.date.fromisoformat(c.details.expiration_date) - today).days >= 7
+            })
+            if valid_exps:
+                nearest_exp = valid_exps[0]
 
-            # Put/Call volume ratio across whole chain
-            total_call_vol = chain.calls['volume'].fillna(0).sum()
-            total_put_vol = chain.puts['volume'].fillna(0).sum()
-            if total_call_vol > 0:
-                pc_vol_ratio = total_put_vol / total_call_vol
+                # Split into calls/puts for nearest expiry with valid IV
+                near = [c for c in contracts
+                        if c.details and c.details.expiration_date == nearest_exp
+                        and c.implied_volatility and c.implied_volatility > 0.005]
+                calls = [c for c in near if c.details.contract_type == 'call']
+                puts  = [c for c in near if c.details.contract_type == 'put']
 
-        vrp = (current_iv - current_hv) if current_iv else None
+                # ATM call IV
+                if calls:
+                    atm_call = min(calls, key=lambda c: abs(c.details.strike_price - spot))
+                    current_iv = atm_call.implied_volatility * 100
+
+                # Put skew: 90% moneyness put IV vs ATM call IV
+                if puts and current_iv:
+                    atm_put = min(puts, key=lambda c: abs(c.details.strike_price - spot * 0.90))
+                    skew_ratio = atm_put.implied_volatility * 100 / current_iv
+
+                # Put/Call volume ratio (all near-term contracts)
+                call_vol = sum(c.day.volume for c in calls if c.day and c.day.volume)
+                put_vol  = sum(c.day.volume for c in puts  if c.day and c.day.volume)
+                if call_vol > 0:
+                    pc_vol_ratio = put_vol / call_vol
+
         vrp_ratio = (current_iv / current_hv) if current_iv and current_hv else None
-        verdict = ('Expensive' if vrp_ratio and vrp_ratio > 1.25
+        verdict = ('Market Closed' if current_iv is not None and current_iv == 0
+                   else 'Expensive' if vrp_ratio and vrp_ratio > 1.25
                    else 'Cheap' if vrp_ratio and vrp_ratio < 0.80
                    else 'Neutral' if vrp_ratio else 'N/A')
 
-        # --- Directional bias: skew + P/C volume each cast a vote ---
         skew_bearish = skew_ratio is not None and skew_ratio > 1.15
         skew_bullish = skew_ratio is not None and skew_ratio < 0.88
         pc_bearish   = pc_vol_ratio is not None and pc_vol_ratio > 1.10
@@ -318,7 +356,6 @@ def scan_ticker(ticker_symbol):
         bull_votes = int(skew_bullish) + int(pc_bullish)
         bias = "Bearish" if bear_votes > bull_votes else "Bullish" if bull_votes > bear_votes else "Neutral"
 
-        # --- Recommendations: direction + VRP tells you whether to buy or sell premium ---
         iv_cheap     = vrp_ratio is not None and vrp_ratio < 0.85
         iv_expensive = vrp_ratio is not None and vrp_ratio > 1.25
 
@@ -340,7 +377,6 @@ def scan_ticker(ticker_symbol):
             'Ticker':   ticker_symbol,
             'IV %':     f"{current_iv:.1f}" if current_iv else 'N/A',
             'HV %':     f"{current_hv:.1f}",
-            'VRP':      f"{vrp:+.1f}" if vrp is not None else 'N/A',
             'IV/HV':    f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
             'Skew':     f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
             'P/C Vol':  f"{pc_vol_ratio:.2f}" if pc_vol_ratio else 'N/A',
@@ -741,17 +777,6 @@ scanner_layout = html.Div([
             html.Button('Scan Options', id='scanner-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '10px', 'width': '100%'}),
             html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.85em', 'fontStyle': 'italic', 'marginTop': '6px'}),
 
-            html.Hr(className='section-divider'),
-
-            html.Div([
-                html.P("How to read the table:", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.85em', 'marginBottom': '6px'}),
-                make_stat_row("IV %", "ATM implied vol (front-month)"),
-                make_stat_row("HV %", "30-day realized vol"),
-                make_stat_row("VRP", "IV minus HV (+ = options expensive)"),
-                make_stat_row("IV/HV", "> 1.25x = Expensive, < 0.80x = Cheap"),
-                make_stat_row("Skew", "OTM put IV / ATM IV ratio"),
-                make_stat_row("HV Rank", "Realized vol percentile (1yr)"),
-            ])
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Loading(html.Div(id='scanner-results-table'), type='circle'),
@@ -1565,11 +1590,39 @@ def run_scanner(n_clicks, tickers_raw):
     if not n_clicks or not tickers_raw:
         return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), ""
     tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
-    rows = [r for r in (scan_ticker(t) for t in tickers) if r]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        rows = [r for r in pool.map(scan_ticker, tickers) if r]
     if not rows:
         return html.Div("No data returned. Check tickers.", style={'color': colors['danger'], 'padding': '20px'}), ""
 
-    col_order = ['Ticker', 'IV %', 'HV %', 'VRP', 'IV/HV', 'Skew', 'P/C Vol', 'HV Rank', 'Bias', 'Call Rec', 'Put Rec', 'Verdict']
+    col_order = ['Ticker', 'IV %', 'HV %', 'IV/HV', 'Skew', 'P/C Vol', 'HV Rank', 'Bias', 'Call Rec', 'Put Rec']
+
+    # Per-row heatmap styles for IV/HV and Bias
+    bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
+    cell_styles = []
+    for i, row in enumerate(rows):
+        ivhv_str = row.get('IV/HV', 'N/A')
+        if ivhv_str != 'N/A':
+            try:
+                val = float(ivhv_str.replace('x', ''))
+                t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
+                bg = pc.sample_colorscale('RdYlGn', [t])[0]
+                cell_styles.append({'if': {'row_index': i, 'column_id': 'IV/HV'}, 'backgroundColor': bg, 'color': '#111'})
+            except Exception:
+                pass
+        skew_str = row.get('Skew', 'N/A')
+        if skew_str != 'N/A':
+            try:
+                val = float(skew_str.replace('x', ''))
+                t = 1.0 - max(0.0, min(1.0, (val - 0.75) / 0.5))
+                bg = pc.sample_colorscale('RdYlGn', [t])[0]
+                cell_styles.append({'if': {'row_index': i, 'column_id': 'Skew'}, 'backgroundColor': bg, 'color': '#111'})
+            except Exception:
+                pass
+        t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
+        bg_bias = pc.sample_colorscale('RdYlGn', [t_bias])[0]
+        cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'}, 'backgroundColor': bg_bias, 'color': '#111', 'fontWeight': 'bold'})
+
     table = dash_table.DataTable(
         data=rows,
         columns=[{'name': c, 'id': c} for c in col_order],
@@ -1584,13 +1637,6 @@ def run_scanner(n_clicks, tickers_raw):
             'padding': '10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"
         },
         style_data_conditional=[
-            # Verdict coloring
-            {'if': {'filter_query': '{Verdict} = "Expensive"'}, 'backgroundColor': '#150000', 'color': colors['put_text']},
-            {'if': {'filter_query': '{Verdict} = "Cheap"'},     'backgroundColor': '#001500', 'color': colors['call_text']},
-            # Bias coloring
-            {'if': {'filter_query': '{Bias} = "Bearish"', 'column_id': 'Bias'}, 'color': colors['put_text'], 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Bias} = "Bullish"', 'column_id': 'Bias'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Bias} = "Neutral"', 'column_id': 'Bias'}, 'color': colors['muted']},
             # Call Rec coloring
             {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
             {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
@@ -1601,6 +1647,7 @@ def run_scanner(n_clicks, tickers_raw):
             {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'}, 'color': colors['muted']},
             # Ticker highlight
             {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']},
+            *cell_styles,
         ],
         sort_action='native',
         tooltip_header={
@@ -1609,7 +1656,6 @@ def run_scanner(n_clicks, tickers_raw):
             'Bias':    'Directional vote from Skew + P/C Vol. Both must agree for Bullish/Bearish.',
             'Call Rec':'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
             'Put Rec': 'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
-            'Verdict': 'IV/HV ratio. >1.25x = Expensive (sell premium). <0.80x = Cheap (buy premium).',
         },
         tooltip_delay=0,
         tooltip_duration=None,
