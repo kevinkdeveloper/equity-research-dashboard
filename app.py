@@ -533,26 +533,26 @@ PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '2y', 5: '5y', 6: '10y',
 CAL_PERIOD_MAP = {0: '1y', 1: '2y', 2: '3y', 3: '5y', 4: '10y', 5: 'max'}
 
 SPREAD_LINE_COLORS = [
-    '#ff6600',  # orange (accent)
-    '#ef4444',  # red
-    '#22c55e',  # green
-    '#3b82f6',  # blue
-    '#a855f7',  # purple
-    '#eab308',  # yellow
-    '#06b6d4',  # cyan
-    '#f472b6',  # pink
-    '#f97316',  # deep orange
-    '#84cc16',  # lime
-    '#6366f1',  # indigo
-    '#14b8a6',  # teal
-    '#fb923c',  # amber-orange
-    '#e879f9',  # fuchsia
-    '#4ade80',  # light green
-    '#60a5fa',  # light blue
-    '#c084fc',  # lavender
-    '#fbbf24',  # gold
-    '#34d399',  # emerald
-    '#f87171',  # light red
+    '#FF3333',  # red          (0°)
+    '#3366FF',  # blue         (225°)
+    '#33CC55',  # green        (135°)
+    '#FF9900',  # orange       (36°)
+    '#CC33FF',  # purple       (275°)
+    '#00CCDD',  # cyan         (185°)
+    '#FFD700',  # yellow       (51°)
+    '#FF44AA',  # hot pink     (325°)
+    '#00BB88',  # teal         (163°)
+    '#FF6633',  # red-orange   (15°)
+    '#55AAFF',  # sky blue     (210°)
+    '#99DD00',  # lime         (88°)
+    '#CC33BB',  # violet       (308°)
+    '#00DDBB',  # turquoise    (172°)
+    '#FFAA33',  # amber        (38°)
+    '#4455DD',  # indigo       (236°)
+    '#FF8899',  # salmon       (352°)
+    '#44CC88',  # mint         (150°)
+    '#DD6622',  # burnt orange (22°)
+    '#88AAFF',  # periwinkle   (228°)
 ]
 
 spread_layout = html.Div([
@@ -898,6 +898,8 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
             **layout_settings,
         )
 
+        daily_ret = df.pct_change().dropna()
+
         stat_rows = [
             html.H4("Returns", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
             make_stat_row("Period", selected_period.upper()),
@@ -907,6 +909,18 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
             ret = (df[col].iloc[-1] / df[col].iloc[0] - 1) * 100
             ret_color = colors['call_text'] if ret >= 0 else colors['put_text']
             stat_rows.append(make_stat_row(col, f"{ret:+.1f}%", ret_color))
+
+        stat_rows += [
+            html.Hr(className='section-divider'),
+            html.H4("Sharpe Ratio", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
+        ]
+        for col in df.columns:
+            std = daily_ret[col].std()
+            sharpe = (daily_ret[col].mean() / std * np.sqrt(252)) if std > 0 else 0
+            sharpe_color = (colors['call_text'] if sharpe > 1
+                            else colors['put_text'] if sharpe < 0
+                            else colors['text'])
+            stat_rows.append(make_stat_row(col, f"{sharpe:.2f}", sharpe_color))
 
         if len(df.columns) >= 2:
             corr = df.pct_change().corr()
