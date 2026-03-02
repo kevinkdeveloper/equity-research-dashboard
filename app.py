@@ -17,6 +17,14 @@ try:
 except ImportError:
     POLYGON_AVAILABLE = False
 
+try:
+    from ib_insync import IB, Stock, Option
+    IBKR_AVAILABLE = True
+except ImportError:
+    IBKR_AVAILABLE = False
+
+_ibkr_client_id = 10   # increments on each call to avoid "already in use" errors
+
 # -----------------------------------------------------------------------------
 # 1. SETTINGS & DEFAULTS
 # -----------------------------------------------------------------------------
@@ -697,7 +705,13 @@ vol_surface_layout = html.Div([
                 style={'marginBottom': '10px'},
             ),
 
-            html.Button('Fetch Surface', id='vol-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '6px'}),
+            html.Div(style={'display': 'flex', 'flexDirection': 'column', 'gap': '6px', 'marginTop': '6px'}, children=[
+                html.Button('Fetch  (Polygon)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
+                html.Button('Live  (IBKR)', id='vol-ibkr-btn', n_clicks=0,
+                            style={**BUTTON_STYLE, 'backgroundColor': '#1a472a', 'borderColor': '#2d6a4f'}),
+                html.Button('Last Close  (IBKR)', id='vol-ibkr-close-btn', n_clicks=0,
+                            style={**BUTTON_STYLE, 'backgroundColor': '#1a3347', 'borderColor': '#2a5a8a'}),
+            ]),
             html.Hr(className='section-divider'),
             html.Div(id='vol-info-display', children=html.Div([
                 html.P("Surface data will appear here after fetch.", style={'color': colors['muted'], 'fontStyle': 'italic'})
@@ -1010,6 +1024,177 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
 
 # --- VOLATILITY SURFACE CALLBACK (Polygon.io) ---
 # Slider is a State — only the Fetch button fires an API call.
+def fetch_ibkr_surface(ticker, contract_type, moneyness_pct,
+                        host='127.0.0.1', port=4001, use_close=False):
+    """Pull an options chain from IB Gateway. IV is calculated from option prices
+    via Black-Scholes inversion — no dependency on IBKR greeks.
+    use_close=True  → frozen market data type, uses t.close as option price
+    use_close=False → live market data, uses (bid+ask)/2 as option price
+    Returns (data_dict, error_string)."""
+    if not IBKR_AVAILABLE:
+        return None, "ib_insync not installed. Run: pip install ib_insync"
+
+    import asyncio, math
+    from scipy.optimize import brentq
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
+    def _valid(p):
+        return p is not None and not (isinstance(p, float) and math.isnan(p)) and p > 0
+
+    def _calc_iv(S, K, T, price, right):
+        """Invert Black-Scholes to get IV from an option price."""
+        if not (_valid(S) and _valid(K) and T > 0 and _valid(price)):
+            return None
+        intrinsic = max(0.0, S - K) if right == 'call' else max(0.0, K - S)
+        if price <= intrinsic:
+            return None
+        try:
+            obj = lambda sigma: black_scholes(S, K, T, 0.045, sigma, right) - price
+            if obj(0.001) * obj(20.0) >= 0:
+                return None
+            return brentq(obj, 0.001, 20.0, xtol=1e-6, maxiter=100)
+        except Exception:
+            return None
+
+    global _ibkr_client_id
+    _ibkr_client_id = (_ibkr_client_id % 20) + 10   # cycles 10 → 29
+
+    ib = IB()
+    try:
+        ib.connect(host, port, clientId=_ibkr_client_id, timeout=15)
+    except Exception as e:
+        return None, f"Cannot connect to IB Gateway ({host}:{port}): {e}"
+
+    try:
+        today = datetime.date.today()
+
+        # --- Underlying close / spot price ---
+        stock = Stock(ticker, 'SMART', 'USD')
+        ib.qualifyContracts(stock)
+
+        bars = ib.reqHistoricalData(stock, endDateTime='', durationStr='2 D',
+                                    barSizeSetting='1 day', whatToShow='TRADES',
+                                    useRTH=True, formatDate=1)
+        spot = bars[-1].close if bars else None
+        if not _valid(spot):
+            return None, "Could not retrieve underlying price from IBKR"
+
+        # --- Option chain definition ---
+        chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
+        if not chains:
+            return None, f"No option chain found for {ticker} on IBKR"
+        chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
+
+        expirations = sorted([
+            e for e in chain.expirations
+            if 3 <= (datetime.date.fromisoformat(e) - today).days <= 365
+        ])[:20]
+        if not expirations:
+            return None, "No near-term expirations found"
+
+        lo, hi = spot * (1 - moneyness_pct), spot * (1 + moneyness_pct)
+        strikes = [s for s in sorted(chain.strikes) if lo <= s <= hi]
+        if not strikes:
+            return None, "No strikes within moneyness range"
+        # Thin to ≤25 evenly-spaced strikes — dense strikes overflow Gateway's buffer
+        if len(strikes) > 25:
+            idx = np.linspace(0, len(strikes) - 1, 25, dtype=int)
+            strikes = [strikes[i] for i in idx]
+
+        rights = []
+        if contract_type in ('call', 'both'): rights.append('C')
+        if contract_type in ('put',  'both'): rights.append('P')
+
+        # --- Build & qualify contracts ---
+        contracts = [
+            Option(ticker, exp, s, r, 'SMART')
+            for exp in expirations
+            for s in strikes
+            for r in rights
+        ]
+        ib.qualifyContracts(*contracts)
+        contracts = [c for c in contracts if c.conId]
+        if not contracts:
+            return None, "No valid option contracts after qualification"
+
+        # --- Fetch option prices in batches to avoid Gateway buffer overflow ---
+        # Frozen mode (type 2) returns last-close prices even after hours.
+        # Live mode (type 1) returns real-time bid/ask.
+        if use_close:
+            ib.reqMarketDataType(2)
+        tickers = []
+        for i in range(0, len(contracts), 50):
+            tickers.extend(ib.reqTickers(*contracts[i:i + 50]))
+        if use_close:
+            ib.reqMarketDataType(1)
+
+        # --- Build surface via BS IV inversion on prices ---
+        strikes_out, dtes_out, ivs_out, prices_out = [], [], [], []
+        exps_out, ctypes_out = [], []
+
+        n_no_price = 0
+        n_iv_fail  = 0
+
+        for t in tickers:
+            if not t.contract:
+                continue
+            exp_str = t.contract.lastTradeDateOrContractMonth
+            try:
+                dte = (datetime.date.fromisoformat(exp_str) - today).days
+            except Exception:
+                continue
+
+            if use_close:
+                price = t.close if _valid(t.close) else None
+            else:
+                price = (t.bid + t.ask) / 2 if (_valid(t.bid) and _valid(t.ask)) else None
+
+            if not _valid(price):
+                n_no_price += 1
+                continue
+
+            right = 'call' if t.contract.right == 'C' else 'put'
+            iv = _calc_iv(spot, float(t.contract.strike), dte / 365.0, price, right)
+            if not iv:
+                n_iv_fail += 1
+                continue
+
+            strikes_out.append(float(t.contract.strike))
+            dtes_out.append(dte)
+            ivs_out.append(iv)
+            prices_out.append(price)
+            exps_out.append(exp_str)
+            ctypes_out.append(right)
+
+        if len(strikes_out) < 5:
+            return None, (
+                f"Too few valid quotes ({len(strikes_out)}) from {len(tickers)} contracts. "
+                f"No price: {n_no_price}, IV calc failed: {n_iv_fail}. "
+                f"Spot: {spot:.2f}, mode: {'close' if use_close else 'live'}."
+            )
+
+        return {
+            'strikes': strikes_out, 'dtes': dtes_out, 'ivs': ivs_out,
+            'prices': prices_out, 'deltas': [None] * len(strikes_out),
+            'volumes': [None] * len(strikes_out),
+            'exps': exps_out, 'ctypes': ctypes_out, 'spot': spot,
+            'contract_count': len(strikes_out),
+            'exp_count': len(set(exps_out)),
+            'source': 'IBKR (Close)' if use_close else 'IBKR (Live)',
+        }, None
+
+    except Exception as e:
+        return None, f"IBKR error: {e}"
+    finally:
+        ib.disconnect()
+
+
 # Results are cached per (ticker, date, contract_type, moneyness) so re-visiting
 # a previously fetched date is instant with zero additional API calls.
 def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness_pct):
@@ -1040,6 +1225,24 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
     z_display  = "Option Price" if use_price else "Implied Vol"
     spot_label = f"  Spot: ${spot:.2f}" if spot else ""
 
+    # Build DTE → expiry date tick mapping; only label the first expiry per month
+    dte_to_exp = {}
+    for d, e in zip(data['dtes'], data['exps']):
+        dte_to_exp[d] = e
+    sorted_dte_exp = sorted(dte_to_exp.items())
+    y_tickvals, y_ticktext = [], []
+    seen_months = set()
+    for d, e in sorted_dte_exp:
+        try:
+            dt = datetime.date.fromisoformat(e)
+            month_key = (dt.year, dt.month)
+            label = dt.strftime("%b %d") if month_key not in seen_months else ""
+            seen_months.add(month_key)
+        except:
+            label = e
+        y_tickvals.append(d)
+        y_ticktext.append(label)
+
     fig = go.Figure()
     if plot_type == 'surface':
         sg = np.linspace(min(z_strikes), max(z_strikes), 50)
@@ -1053,6 +1256,20 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
             colorbar=dict(title=z_label, tickprefix=z_tickprefix, ticksuffix=z_ticksuffix),
             hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
         ))
+        if spot:
+            si = int(np.argmin(np.abs(np.array(sg) - spot)))
+            z_col = Z[:, si]
+            mask = ~np.isnan(z_col)
+            if mask.any():
+                fig.add_trace(go.Scatter3d(
+                    x=np.full(mask.sum(), sg[si]),
+                    y=dg[mask],
+                    z=z_col[mask],
+                    mode='lines',
+                    name=f'Spot ${spot:.2f}',
+                    line=dict(color='white', width=5),
+                    showlegend=True,
+                ))
     else:
         fig.add_trace(go.Scatter3d(
             x=z_strikes, y=z_dtes, z=z_vals, mode='markers',
@@ -1061,15 +1278,29 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
             hovertemplate=f"Strike: $%{{x:.0f}}<br>DTE: %{{y:.0f}}d<br>{z_display}: {hover_z}<extra></extra>",
             name=z_display,
         ))
+        if spot:
+            fig.add_trace(go.Scatter3d(
+                x=[spot, spot],
+                y=[min(z_dtes), max(z_dtes)],
+                z=[min(z_vals), min(z_vals)],
+                mode='lines+text',
+                name=f'Spot ${spot:.2f}',
+                line=dict(color='white', width=5),
+                text=[f'${spot:.0f}', ''],
+                textposition='top center',
+                textfont=dict(color='white', size=10),
+                showlegend=True,
+            ))
 
     today_str = datetime.date.today().isoformat()
     fig.update_layout(
         title=f"{sym} {ct_label} {z_display} Surface — Live{spot_label}",
         scene=dict(
             camera=dict(up=dict(x=0,y=0,z=1), center=dict(x=0,y=0,z=0), eye=dict(x=-1.8,y=-1.2,z=1.0)),
-            xaxis_title='Strike ($)', yaxis_title='DTE (days)', zaxis_title=z_label,
+            xaxis_title='Strike ($)', zaxis_title=z_label,
             xaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
-            yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
+            yaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True,
+                       title='Expiry', tickvals=y_tickvals, ticktext=y_ticktext),
             zaxis=dict(backgroundcolor=colors['card_bg'], gridcolor='#333', showbackground=True),
         ),
         margin=dict(l=0, r=0, t=40, b=0),
@@ -1109,7 +1340,9 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
     [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children'),
      Output('vol-data-store', 'data'), Output('vol-smile-expiry', 'marks'),
      Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value')],
-    [Input('vol-submit-btn', 'n_clicks')],
+    [Input('vol-submit-btn', 'n_clicks'),
+     Input('vol-ibkr-btn', 'n_clicks'),
+     Input('vol-ibkr-close-btn', 'n_clicks')],
     [State('vol-ticker-input', 'value'),
      State('vol-contract-type', 'value'),
      State('vol-moneyness-slider', 'value'),
@@ -1117,7 +1350,7 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
      State('vol-plot-type', 'value')],
     prevent_initial_call=True
 )
-def update_vol_surface(_n, ticker_symbol, contract_type, moneyness_slider, z_axis, plot_type):
+def update_vol_surface(_n_poly, _n_ibkr, _n_ibkr_close, ticker_symbol, contract_type, moneyness_slider, z_axis, plot_type):
     empty_fig = go.Figure(layout=layout_settings)
 
     if not ticker_symbol:
@@ -1125,11 +1358,21 @@ def update_vol_surface(_n, ticker_symbol, contract_type, moneyness_slider, z_axi
 
     sym           = ticker_symbol.upper().strip()
     moneyness_pct = (moneyness_slider or 25) / 100
+    triggered     = ctx.triggered_id
 
-    data, err = fetch_polygon_surface(sym, contract_type, moneyness_pct, POLYGON_API_KEY)
+    if triggered == 'vol-ibkr-btn':
+        data, err    = fetch_ibkr_surface(sym, contract_type, moneyness_pct, use_close=False)
+        source_label = "IBKR (Live)"
+    elif triggered == 'vol-ibkr-close-btn':
+        data, err    = fetch_ibkr_surface(sym, contract_type, moneyness_pct, use_close=True)
+        source_label = "IBKR (Close)"
+    else:
+        data, err    = fetch_polygon_surface(sym, contract_type, moneyness_pct, POLYGON_API_KEY)
+        source_label = "Polygon"
+
     if err:
         info = html.Div([
-            html.Div("Data fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
+            html.Div(f"{source_label} fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
             html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
         ])
         return empty_fig, info, no_update, no_update, no_update, no_update
