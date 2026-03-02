@@ -26,7 +26,7 @@ DEFAULT_VOL = 0.2
 DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
-DEFAULT_SCANNER_TICKERS = "SPY, AAPL, TSLA, NVDA, AMD, MSFT, AMZN, META, GOOGL, GLD, SLV, TLT"
+DEFAULT_SCANNER_TICKERS = "SPY, QQQ, AAPL, TSLA, NVDA, MSFT, AMZN, META, GOOGL, GLD, SLV, TLT"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'qvG5Nf6OFdw8Od7oMVeUo7B0q3lB0zbo')
 
 # --- Historical vol-surface date slider: weekly steps for the past ~2 years ---
@@ -529,7 +529,7 @@ bs_layout = html.Div([
 ])
 
 # --- 3. SPREAD ANALYSIS TAB LAYOUT ---
-PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '2y', 5: '5y', 6: '10y', 7: 'max'}
+PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '3y', 5: '5y', 6: '10y', 7: 'max'}
 CAL_PERIOD_MAP = {0: '1y', 1: '2y', 2: '3y', 3: '5y', 4: '10y', 5: 'max'}
 
 SPREAD_LINE_COLORS = [
@@ -567,13 +567,26 @@ spread_layout = html.Div([
                          placeholder="e.g. SPY, QQQ, DIA",
                          style={**INPUT_STYLE, 'height': '70px', 'resize': 'vertical', 'fontFamily': 'monospace'}),
 
-            html.Label("Lookback Period", style={'color': colors['text'], 'fontWeight': 'bold', 'marginBottom': '10px', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '12px'}),
-            html.Div(style={'padding': '0 10px 20px 10px'}, children=[
-                dcc.Slider(
+            html.Label("Date Range", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '12px', 'marginBottom': '4px'}),
+            html.Div("Drag both handles to set start and end.", className='helper-text'),
+            html.Div(style={'padding': '0 10px 28px 10px'}, children=[
+                dcc.RangeSlider(
                     id='spread-period-slider',
-                    min=0, max=7, step=1,
-                    value=2,
-                    marks={0: '1M', 1: '3M', 2: '6M', 3: '1Y', 4: '2Y', 5: '5Y', 6: '10Y', 7: 'MAX'},
+                    min=0, max=12, step=1,
+                    value=[4, 12],
+                    marks={
+                        0:  {'label': 'MAX', 'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        2:  {'label': '15Y', 'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        4:  {'label': '10Y', 'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        6:  {'label': '5Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        7:  {'label': '3Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        8:  {'label': '2Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        9:  {'label': '1Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        10: {'label': '6M',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        11: {'label': '3M',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        12: {'label': 'Now', 'style': {'color': '#888', 'fontSize': '0.75em'}},
+                    },
+                    tooltip={'always_visible': False, 'placement': 'bottom'},
                 )
             ]),
 
@@ -866,12 +879,38 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
     if not tickers:
         return go.Figure(layout=layout_settings), html.Div()
 
-    selected_period = PERIOD_MAP.get(slider_val, '6mo')
+    # Map slider index → date offset from today
+    today = datetime.date.today()
+    _date_map = {
+        0:  None,                                       # MAX
+        1:  today - datetime.timedelta(days=365 * 20),
+        2:  today - datetime.timedelta(days=365 * 15),
+        3:  today - datetime.timedelta(days=365 * 12),
+        4:  today - datetime.timedelta(days=365 * 10),
+        5:  today - datetime.timedelta(days=365 * 7),
+        6:  today - datetime.timedelta(days=365 * 5),
+        7:  today - datetime.timedelta(days=365 * 3),
+        8:  today - datetime.timedelta(days=365 * 2),
+        9:  today - datetime.timedelta(days=365),
+        10: today - datetime.timedelta(days=182),
+        11: today - datetime.timedelta(days=91),
+        12: today,
+    }
+    start_idx, end_idx = (slider_val if isinstance(slider_val, list) else [slider_val, 12])
+    start_date = _date_map.get(start_idx)
+    end_date   = _date_map.get(end_idx, today)
+
+    selected_period = (
+        f"{start_date.isoformat()} → {end_date.isoformat()}" if start_date
+        else f"MAX → {end_date.isoformat()}"
+    )
 
     try:
+        hist_kwargs = ({'start': start_date.isoformat(), 'end': end_date.isoformat()}
+                       if start_date else {'period': 'max'})
         series = {}
         for t in tickers:
-            s = yf.Ticker(t).history(period=selected_period)['Close']
+            s = yf.Ticker(t).history(**hist_kwargs)['Close']
             if not s.empty:
                 series[t] = s
 
