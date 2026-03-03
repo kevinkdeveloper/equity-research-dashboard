@@ -6,7 +6,6 @@ import plotly.graph_objects as go
 import plotly.colors as pc
 from plotly.subplots import make_subplots
 import numpy as np
-from scipy.stats import norm
 from scipy.interpolate import griddata
 import yfinance as yf
 import pandas as pd
@@ -66,67 +65,6 @@ def get_initial_price(ticker_symbol):
 
 initial_spot = get_initial_price(DEFAULT_TICKER)
 initial_strike = initial_spot
-
-def black_scholes(S, K, T, r, sigma, option_type='call'):
-    try:
-        S, K, T, r, sigma = float(S), float(K), float(T), float(r), float(sigma)
-    except: return 0.0
-    if T <= 0 or sigma <= 0: return max(0, S - K) if option_type == 'call' else max(0, K - S)
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    if option_type == 'call':
-        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-    else:
-        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-
-def calculate_greeks(S, K, T, r, sigma, option_type='call'):
-    try:
-        S, K, T, r, sigma = float(S), float(K), float(T), float(r), float(sigma)
-    except: return 0, 0, 0, 0, 0
-    if T <= 0 or sigma <= 0: return 0, 0, 0, 0, 0
-    d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    pdf_d1 = norm.pdf(d1)
-    cdf_d1 = norm.cdf(d1)
-    cdf_d2 = norm.cdf(d2)
-    cdf_neg_d2 = norm.cdf(-d2)
-    gamma = pdf_d1 / (S * sigma * np.sqrt(T))
-    vega = S * pdf_d1 * np.sqrt(T) / 100
-    if option_type == 'call':
-        delta = cdf_d1
-        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) - r * K * np.exp(-r * T) * cdf_d2) / 365
-    else:
-        delta = cdf_d1 - 1
-        theta = (- (S * pdf_d1 * sigma) / (2 * np.sqrt(T)) + r * K * np.exp(-r * T) * cdf_neg_d2) / 365
-    return delta, gamma, theta, vega
-
-def get_bs_charts(S, K, T, r, sigma):
-    lower_bound = max(0.01, S * 0.5)
-    spot_range = np.linspace(lower_bound, S * 1.5, 100)
-    call_prices = [black_scholes(s, K, T, r, sigma, 'call') for s in spot_range]
-    put_prices = [black_scholes(s, K, T, r, sigma, 'put') for s in spot_range]
-
-    fig_spot = go.Figure()
-    fig_spot.add_trace(go.Scatter(x=spot_range, y=call_prices, mode='lines', name='Call Value', line=dict(color=colors['call_text'])))
-    fig_spot.add_trace(go.Scatter(x=spot_range, y=put_prices, mode='lines', name='Put Value', line=dict(color=colors['put_text'])))
-    fig_spot.add_vline(x=S, line_width=1, line_dash="dash", line_color="#666", annotation_text="Spot")
-
-    fig_spot.update_layout(title='Option Value vs. Spot Price', xaxis_title='Spot Price ($)', yaxis_title='Value ($)',
-                           margin=dict(l=20, r=20, t=40, b=20), uirevision='bs-spot',
-                           transition=dict(duration=150, easing='cubic-in-out'), **layout_settings)
-
-    greeks_call = [calculate_greeks(s, K, T, r, sigma, 'call') for s in spot_range]
-    delta_c, gamma_c, theta_c, vega_c = zip(*greeks_call)
-
-    fig_greeks = make_subplots(rows=2, cols=2, subplot_titles=("Delta (Δ)", "Gamma (Γ)", "Theta (Θ)", "Vega (ν)"))
-    fig_greeks.add_trace(go.Scatter(x=spot_range, y=delta_c, name='Call Delta', line=dict(color=colors['call_text']), showlegend=False), 1, 1)
-    fig_greeks.add_trace(go.Scatter(x=spot_range, y=gamma_c, name='Gamma', line=dict(color=colors['accent']), showlegend=False), 1, 2)
-    fig_greeks.add_trace(go.Scatter(x=spot_range, y=theta_c, name='Call Theta', line=dict(color=colors['call_text']), showlegend=False), 2, 1)
-    fig_greeks.add_trace(go.Scatter(x=spot_range, y=vega_c, name='Vega', line=dict(color=colors['accent']), showlegend=False), 2, 2)
-
-    fig_greeks.update_layout(title="Greeks Sensitivity", margin=dict(l=20, r=20, t=40, b=20), uirevision='bs-greeks',
-                             transition=dict(duration=150, easing='cubic-in-out'), **layout_settings)
-    return fig_spot, fig_greeks
 
 
 
@@ -205,6 +143,8 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key):
             if c.underlying_asset and c.underlying_asset.price:
                 spot = c.underlying_asset.price
                 break
+        if not spot:
+            spot = get_initial_price(ticker_symbol) or None
 
         ref_date = today
 
@@ -481,94 +421,6 @@ def make_empty_chart(message="Enter a ticker and click Analyze to get started.")
 
 
 
-# --- 2. BLACK-SCHOLES TAB LAYOUT ---
-# CHANGE: Added helper text to each input explaining what the parameter means
-bs_layout = html.Div([
-    html.Div(style=FLEX_WRAPPER_STYLE, children=[
-        html.Div(style=SIDEBAR_STYLE, children=[
-            html.H3("Option Inputs", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Adjust parameters to price European options using the Black-Scholes model.", className='helper-text', style={'marginTop': '0'}),
-
-            # Ticker lookup — auto-fills Spot & Strike from live price
-            html.Label("Load from Ticker", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            html.Div("Fetches live price to pre-fill Spot & Strike", className='helper-text'),
-            html.Div(style={'display': 'flex', 'gap': '8px', 'marginBottom': '4px'}, children=[
-                dcc.Input(id='bs-ticker-input', type='text', placeholder="e.g. AAPL, NVDA, SPY",
-                          style={**INPUT_STYLE, 'flex': 1}),
-                html.Button('Load', id='bs-load-btn', n_clicks=0, style={
-                    'padding': '10px 14px', 'backgroundColor': '#1a1a1a',
-                    'border': f"1px solid {colors['accent']}", 'borderRadius': '6px',
-                    'color': colors['accent'], 'fontWeight': 'bold', 'cursor': 'pointer',
-                    'whiteSpace': 'nowrap', 'fontSize': '0.9em'
-                }),
-            ]),
-            html.Div(id='bs-ticker-status', style={'minHeight': '18px', 'fontSize': '0.82em', 'marginBottom': '4px'}),
-            html.Hr(className='section-divider'),
-
-            make_control_row("Spot Price ($)", "spot", 0, 800, 0.01, initial_spot,
-                             helper="Current market price of the underlying asset"),
-            make_control_row("Strike Price ($)", "strike", 0, 800, 0.01, initial_strike,
-                             helper="Price at which the option can be exercised"),
-            make_control_row("Time (Years)", "time", 0.01, 5, 0.01, DEFAULT_TIME,
-                             helper="Time remaining until option expiration"),
-            make_control_row("Volatility (σ)", "vol", 0.01, 1.5, 0.01, DEFAULT_VOL,
-                             helper="Annualized standard deviation of returns"),
-            make_control_row("Risk-Free Rate (r)", "rate", 0.0, 0.2, 0.001, DEFAULT_RATE,
-                             helper="Annualized risk-free interest rate (e.g. T-bill)"),
-        ]),
-        html.Div(style=CONTENT_STYLE, children=[
-            # CHANGE: Redesigned price cards with more visual weight and moneyness indicator
-            html.Div(style={'display': 'flex', 'gap': '12px', 'marginBottom': '16px'}, children=[
-                html.Div(style={
-                    'flex': 1, 'backgroundColor': '#001500', 'padding': '16px', 'borderRadius': '10px',
-                    'textAlign': 'center', 'border': f"1px solid {colors['call_text']}"
-                }, children=[
-                    html.Div("CALL", style={'margin': '0', 'fontSize': '0.75em', 'color': colors['call_text'], 'letterSpacing': '1px', 'fontWeight': 'bold'}),
-                    html.H2(id='call-price-display', style={'margin': '8px 0 0 0', 'color': colors['call_text'], 'fontSize': '1.8em'})
-                ]),
-                html.Div(style={
-                    'flex': 1, 'backgroundColor': '#150000', 'padding': '16px', 'borderRadius': '10px',
-                    'textAlign': 'center', 'border': f"1px solid {colors['put_text']}"
-                }, children=[
-                    html.Div("PUT", style={'margin': '0', 'fontSize': '0.75em', 'color': colors['put_text'], 'letterSpacing': '1px', 'fontWeight': 'bold'}),
-                    html.H2(id='put-price-display', style={'margin': '8px 0 0 0', 'color': colors['put_text'], 'fontSize': '1.8em'})
-                ]),
-            ]),
-            # CHANGE: Added Greeks summary row so users see key greeks at a glance
-            html.Div(style={
-                'display': 'flex', 'gap': '8px', 'marginBottom': '16px', 'flexWrap': 'wrap'
-            }, children=[
-                html.Div(id='greeks-delta-card', className='metric-card', style={'flex': '1 1 80px', 'textAlign': 'center', 'minWidth': '80px'}, children=[
-                    html.Div("Delta", style={'color': colors['muted'], 'fontSize': '0.7em', 'textTransform': 'uppercase'}),
-                    html.Div("--", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1em'})
-                ]),
-                html.Div(id='greeks-gamma-card', className='metric-card', style={'flex': '1 1 80px', 'textAlign': 'center', 'minWidth': '80px'}, children=[
-                    html.Div("Gamma", style={'color': colors['muted'], 'fontSize': '0.7em', 'textTransform': 'uppercase'}),
-                    html.Div("--", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1em'})
-                ]),
-                html.Div(id='greeks-theta-card', className='metric-card', style={'flex': '1 1 80px', 'textAlign': 'center', 'minWidth': '80px'}, children=[
-                    html.Div("Theta", style={'color': colors['muted'], 'fontSize': '0.7em', 'textTransform': 'uppercase'}),
-                    html.Div("--", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1em'})
-                ]),
-                html.Div(id='greeks-vega-card', className='metric-card', style={'flex': '1 1 80px', 'textAlign': 'center', 'minWidth': '80px'}, children=[
-                    html.Div("Vega", style={'color': colors['muted'], 'fontSize': '0.7em', 'textTransform': 'uppercase'}),
-                    html.Div("--", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1em'})
-                ]),
-            ]),
-            html.Div(style={'backgroundColor': colors['card_bg'], 'borderRadius': '10px'}, children=[
-                dcc.Tabs(style={'color': colors['text']}, children=[
-                    dcc.Tab(label='Payoff', style={'backgroundColor': colors['card_bg'], 'color': '#666'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                        dcc.Graph(id='payoff-graph', style={'height': '50vh', 'minHeight': '350px'})  # CHANGE: Reduced height to accommodate Greeks cards
-                    ]),
-                    dcc.Tab(label='Greeks', style={'backgroundColor': colors['card_bg'], 'color': '#666'}, selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}, children=[
-                        dcc.Graph(id='greeks-graph', style={'height': '50vh', 'minHeight': '350px'})
-                    ]),
-                ])
-            ])
-        ])
-    ])
-])
-
 # --- 3. SPREAD ANALYSIS TAB LAYOUT ---
 PERIOD_MAP = {0: '1mo', 1: '3mo', 2: '6mo', 3: '1y', 4: '3y', 5: '5y', 6: '10y', 7: 'max'}
 CAL_PERIOD_MAP = {0: '1y', 1: '2y', 2: '3y', 3: '5y', 4: '10y', 5: 'max'}
@@ -736,38 +588,6 @@ vol_surface_layout = html.Div([
     ])
 ])
 
-# --- 5. VOLATILITY ANALYTICS TAB LAYOUT ---
-vol_analytics_layout = html.Div([
-    html.Div(style=FLEX_WRAPPER_STYLE, children=[
-        html.Div(style=SIDEBAR_STYLE, children=[
-            html.H3("Vol Analytics", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Compare realized volatility against implied volatility and track the live skew.", className='helper-text', style={'marginTop': '0'}),
-
-            html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            dcc.Input(id='va-ticker-input', type='text', value=DEFAULT_TICKER, placeholder="e.g. SPY",
-                      style={**INPUT_STYLE, 'marginBottom': '15px'}),
-
-            html.Label("HV Lookback Window (Days)", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block', 'fontSize': '0.9em'}),
-            html.Div("Number of trading days to compute rolling historical volatility.", className='helper-text'),
-            dcc.Slider(id='va-window-slider', min=10, max=90, step=10, value=30, marks={10: '10d', 30: '30d', 60: '60d', 90: '90d'}),
-
-            html.Button('Analyze Volatility', id='va-submit-btn', n_clicks=0, style={**BUTTON_STYLE, 'marginTop': '20px'}),
-            html.Hr(className='section-divider'),
-
-            html.Div(id='va-stats-display',
-                children=html.Div([
-                    html.P("Volatility metrics will appear here.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-                ])
-            )
-        ]),
-        html.Div(style=CONTENT_STYLE, children=[
-            dcc.Loading(dcc.Graph(id='va-hv-chart', style={'height': '45vh', 'minHeight': '300px'}), type='circle'),
-            dcc.Loading(dcc.Graph(id='va-skew-chart', style={'height': '35vh', 'minHeight': '250px', 'marginTop': '10px'}), type='circle')
-        ])
-    ])
-])
-
-
 # --- 6. SCANNER TAB LAYOUT ---
 scanner_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
@@ -849,19 +669,11 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Vol Surface', value='tab-vol',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
-                dcc.Tab(label='Vol Analytics', value='tab-va',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
-                dcc.Tab(label='Black-Scholes', value='tab-bs',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
-                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
-    html.Div(id='bs-content-wrapper', children=bs_layout, style={'display': 'none'}),
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
     html.Div(id='cal-content-wrapper', children=cal_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
-    html.Div(id='va-content-wrapper', children=vol_analytics_layout, style={'display': 'none'}),
     html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'block'}),
 
     # CHANGE: Added footer with context so the app feels polished
@@ -882,21 +694,17 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 
 # Tab Visibility Toggle
 @app.callback(
-    [Output('bs-content-wrapper', 'style'),
-     Output('spread-content-wrapper', 'style'), Output('cal-content-wrapper', 'style'),
-     Output('vol-content-wrapper', 'style'),
-     Output('va-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
+    [Output('spread-content-wrapper', 'style'), Output('cal-content-wrapper', 'style'),
+     Output('vol-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    bs_style, spread_style, cal_style, vol_style, va_style, scanner_style = [{'display': 'none'}] * 6
-    if tab_value == 'tab-bs': bs_style = {'display': 'block'}
-    elif tab_value == 'tab-spread': spread_style = {'display': 'block'}
+    spread_style, cal_style, vol_style, scanner_style = [{'display': 'none'}] * 4
+    if tab_value == 'tab-spread': spread_style = {'display': 'block'}
     elif tab_value == 'tab-cal': cal_style = {'display': 'block'}
     elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
-    elif tab_value == 'tab-va': va_style = {'display': 'block'}
     elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
-    return bs_style, spread_style, cal_style, vol_style, va_style, scanner_style
+    return spread_style, cal_style, vol_style, scanner_style
 
 # --- SPREAD ANALYSIS CALLBACK ---
 @app.callback(
@@ -1103,14 +911,11 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
         if spot:
             fig.add_trace(go.Scatter3d(
                 x=[spot, spot],
-                y=[min(z_dtes), max(z_dtes)],
-                z=[min(z_vals), min(z_vals)],
-                mode='lines+text',
+                y=[min(z_dtes), min(z_dtes)],
+                z=[min(z_vals), max(z_vals)],
+                mode='lines',
                 name=f'Spot ${spot:.2f}',
-                line=dict(color='white', width=5),
-                text=[f'${spot:.0f}', ''],
-                textposition='top center',
-                textfont=dict(color='white', size=10),
+                line=dict(color='white', width=4),
                 showlegend=True,
             ))
 
@@ -1178,13 +983,13 @@ def update_vol_surface(_n_poly, plot_type, z_axis, ticker_symbol, contract_type,
     # --- Re-render from cache (no fetch) when only display toggles changed ---
     if triggered in ('vol-plot-type', 'vol-z-axis'):
         if not stored_data:
-            return no_update, no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update, no_update
         sym           = (ticker_symbol or '').upper().strip()
         moneyness_pct = (moneyness_slider or 25) / 100
         fig, _, _, _ = _build_surface_figure(stored_data, sym, contract_type, z_axis, plot_type, moneyness_pct)
         if fig is None:
-            return no_update, no_update, no_update, no_update, no_update, no_update, no_update
-        return fig, no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update, no_update
+        return fig, no_update, no_update, no_update, no_update, no_update
 
     # --- Fetch fresh data ---
     if not ticker_symbol:
@@ -1305,251 +1110,6 @@ def update_vol_smile(drag_idx, value_idx, store_data, z_axis):
     )
     return fig
 
-
-# --- VOLATILITY ANALYTICS CALLBACK ---
-# CHANGE: Improved stats panel with visual indicators and better organization
-@app.callback(
-    [Output('va-hv-chart', 'figure'), Output('va-skew-chart', 'figure'), Output('va-stats-display', 'children')],
-    [Input('va-submit-btn', 'n_clicks')],
-    [State('va-ticker-input', 'value'), State('va-window-slider', 'value')]
-)
-def update_vol_analytics(n_clicks, ticker_symbol, window):
-    if not ticker_symbol:
-        return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div()
-
-    ticker_symbol = ticker_symbol.upper().strip()
-
-    try:
-        ticker = yf.Ticker(ticker_symbol)
-
-        hist = ticker.history(period="1y")
-        if hist.empty or len(hist) < window:
-            return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div(f"Not enough historical data for {ticker_symbol}.", style={'color': colors['danger']})
-
-        hist['Log_Ret'] = np.log(hist['Close'] / hist['Close'].shift(1))
-        hist['HV'] = hist['Log_Ret'].rolling(window=window).std() * np.sqrt(252) * 100
-        hist = hist.dropna()
-
-        current_hv = hist['HV'].iloc[-1]
-        hv_min = hist['HV'].min()
-        hv_max = hist['HV'].max()
-        rvr = ((current_hv - hv_min) / (hv_max - hv_min)) * 100
-
-        options = ticker.options
-        current_iv = None
-        fig_skew = go.Figure()
-        skew_ratio_text = "N/A"
-
-        if options:
-            today = datetime.datetime.now().date()
-            valid_expiries = [exp for exp in options if (datetime.datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 7]
-            target_exp = valid_expiries[0] if valid_expiries else options[0]
-
-            chain = ticker.option_chain(target_exp)
-            calls = chain.calls
-            puts = chain.puts
-            spot_price = hist['Close'].iloc[-1]
-
-            atm_call = calls.iloc[(calls['strike'] - spot_price).abs().argsort()[:1]]
-            if not atm_call.empty:
-                current_iv = atm_call['impliedVolatility'].values[0] * 100
-
-            lower_bound, upper_bound = spot_price * 0.8, spot_price * 1.2
-            calls_skew = calls[(calls['strike'] >= lower_bound) & (calls['strike'] <= upper_bound) & (calls['volume'] > 0)]
-            puts_skew = puts[(puts['strike'] >= lower_bound) & (puts['strike'] <= upper_bound) & (puts['volume'] > 0)]
-
-            fig_skew.add_trace(go.Scatter(x=puts_skew['strike'], y=puts_skew['impliedVolatility']*100, mode='lines+markers', name='Puts IV', line=dict(color=colors['put_text'])))
-            fig_skew.add_trace(go.Scatter(x=calls_skew['strike'], y=calls_skew['impliedVolatility']*100, mode='lines+markers', name='Calls IV', line=dict(color=colors['call_text'])))
-            fig_skew.add_vline(x=spot_price, line_width=2, line_dash="dash", line_color="#666", annotation_text="Spot")
-
-            fig_skew.update_layout(title=f"Live Volatility Skew (Expiry: {target_exp})", xaxis_title="Strike Price ($)", yaxis_title="Implied Volatility (%)", margin=dict(l=20, r=20, t=40, b=20),
-                                   uirevision=ticker_symbol, transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
-
-            otm_put_target = spot_price * 0.90
-            closest_put = puts.iloc[(puts['strike'] - otm_put_target).abs().argsort()[:1]]
-            skew_ratio_num = None
-            if not closest_put.empty and current_iv:
-                otm_put_iv = closest_put['impliedVolatility'].values[0] * 100
-                skew_ratio_num = otm_put_iv / current_iv
-                skew_ratio_text = f"{skew_ratio_num:.2f}x"
-
-            # Term structure: compare front-month vs back-month ATM IV
-            back_month_iv = None
-            back_valid = [exp for exp in options if (datetime.datetime.strptime(exp, "%Y-%m-%d").date() - today).days >= 45]
-            if back_valid and current_iv:
-                try:
-                    back_chain = ticker.option_chain(back_valid[0])
-                    back_calls = back_chain.calls
-                    atm_back = back_calls.iloc[(back_calls['strike'] - spot_price).abs().argsort()[:1]]
-                    if not atm_back.empty:
-                        back_month_iv = atm_back['impliedVolatility'].values[0] * 100
-                except:
-                    pass
-            term_slope = (back_month_iv - current_iv) if back_month_iv else None
-
-        else:
-            skew_ratio_num = None
-            term_slope = None
-            fig_skew.update_layout(title="No Options Data Available for Skew", uirevision=ticker_symbol, **layout_settings)
-
-        fig_hv = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-                            row_heights=[0.6, 0.4], subplot_titles=(f"{ticker_symbol} Price", f"{window}-Day Rolling Historical Volatility (HV)"))
-        fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['Close'], mode='lines', name='Price', line=dict(color=colors['accent'], width=2)), row=1, col=1)
-        fig_hv.add_trace(go.Scatter(x=hist.index, y=hist['HV'], mode='lines', name=f'{window}d HV', line=dict(color=colors['put_text'], width=2)), row=2, col=1)
-
-        fig_hv.update_layout(margin=dict(l=20, r=20, t=40, b=20), showlegend=False,
-                             uirevision=ticker_symbol, transition=dict(duration=200, easing='cubic-in-out'), **layout_settings)
-        fig_hv.update_yaxes(title_text="Price ($)", row=1, col=1)
-        fig_hv.update_yaxes(title_text="Volatility (%)", row=2, col=1)
-
-        # CHANGE: Redesigned stats panel with sections, visual HV rank bar, and clearer layout
-        vrp_text = "N/A"
-        vrp_color = colors['text']
-        if current_iv:
-            vrp = current_iv - current_hv
-            vrp_text = f"{vrp:+.2f}%"
-            vrp_color = colors['success'] if vrp > 0 else colors['danger']
-
-        stats_html = html.Div([
-            html.H4("Volatility Metrics", style={'color': colors['text'], 'marginBottom': '12px', 'fontSize': '1em'}),
-
-            make_stat_row("Realized HV", f"{current_hv:.2f}%"),
-            make_stat_row("ATM Implied Vol", f"{current_iv:.2f}%" if current_iv else "N/A", colors['accent']),
-            make_stat_row("Vol Risk Premium", vrp_text, vrp_color),
-
-            # CHANGE: VRP badge indicating if options are "rich" or "cheap"
-            html.Div(style={'marginBottom': '12px', 'marginTop': '4px'}, children=[
-                html.Span(
-                    "Options Expensive" if current_iv and (current_iv - current_hv) > 0 else "Options Cheap",
-                    className=f"badge {'badge-green' if current_iv and (current_iv - current_hv) > 0 else 'badge-red'}"
-                )
-            ]) if current_iv else html.Div(),
-
-            html.Hr(className='section-divider'),
-
-            make_stat_row("OTM Put Skew", skew_ratio_text),
-
-            html.Hr(className='section-divider'),
-
-            # CHANGE: HV Rank with a visual progress bar
-            html.Div(style={'marginBottom': '8px'}, children=[
-                html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '6px'}, children=[
-                    html.Span("HV Rank (Percentile)", style={'color': colors['muted'], 'fontSize': '0.9em'}),
-                    html.Span(f"{rvr:.1f}%", style={'fontWeight': 'bold', 'color': colors['call_text'] if rvr < 50 else colors['put_text']})
-                ]),
-                # CHANGE: Visual progress bar for HV rank
-                html.Div(style={'height': '8px', 'backgroundColor': '#1a1a1a', 'borderRadius': '4px', 'overflow': 'hidden'}, children=[
-                    html.Div(style={
-                        'height': '100%', 'borderRadius': '4px',
-                        'width': f"{min(rvr, 100)}%",
-                        'backgroundColor': colors['call_text'] if rvr < 50 else colors['put_text'],
-                        'transition': 'width 0.3s ease'
-                    })
-                ]),
-                # CHANGE: Label under the bar for quick interpretation
-                html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'marginTop': '4px'}, children=[
-                    html.Span("Low", style={'color': '#666', 'fontSize': '0.7em'}),
-                    html.Span("High", style={'color': '#666', 'fontSize': '0.7em'})
-                ])
-            ]),
-
-            html.Hr(className='section-divider'),
-            html.H4("Trading Signals", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-            *[html.Div(style={'marginBottom': '10px'}, children=[
-                html.Div(style={'display': 'flex', 'justifyContent': 'space-between', 'alignItems': 'center', 'marginBottom': '3px'}, children=[
-                    html.Span(s['label'], style={'color': colors['muted'], 'fontSize': '0.8em', 'textTransform': 'uppercase', 'letterSpacing': '0.5px'}),
-                    html.Span(s['signal'], className=f"badge {s['badge']}")
-                ]),
-                html.Div(s['detail'], style={'color': colors['muted'], 'fontSize': '0.75em', 'fontStyle': 'italic'})
-            ]) for s in generate_vol_signals(current_iv, current_hv, rvr, skew_ratio_num, term_slope)]
-        ])
-
-        return fig_hv, fig_skew, stats_html
-
-    except Exception as e:
-        return go.Figure(layout=layout_settings), go.Figure(layout=layout_settings), html.Div([
-            html.Div("Could not fetch data", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
-            html.Div(f"{e}", style={'color': colors['muted'], 'fontSize': '0.85em'})
-        ])
-
-# --- BS TICKER LOOKUP ---
-@app.callback(
-    [Output('spot-input', 'value', allow_duplicate=True),
-     Output('spot-slider', 'value', allow_duplicate=True),
-     Output('strike-input', 'value', allow_duplicate=True),
-     Output('strike-slider', 'value', allow_duplicate=True),
-     Output('bs-ticker-status', 'children')],
-    [Input('bs-load-btn', 'n_clicks')],
-    [State('bs-ticker-input', 'value')],
-    prevent_initial_call=True
-)
-def load_bs_ticker_price(n_clicks, ticker_symbol):
-    if not n_clicks or not ticker_symbol:
-        return (no_update,) * 5
-    sym = ticker_symbol.strip().upper()
-    try:
-        hist = yf.Ticker(sym).history(period='5d')
-        if hist.empty:
-            return no_update, no_update, no_update, no_update, \
-                   html.Span(f'"{sym}" not found.', style={'color': colors['danger']})
-        price = round(hist['Close'].iloc[-1], 2)
-        status = html.Span(f"{sym} @ ${price:.2f}", style={'color': colors['call_text']})
-        return price, price, price, price, status
-    except Exception as e:
-        return no_update, no_update, no_update, no_update, \
-               html.Span(f"Error: {e}", style={'color': colors['danger']})
-
-# --- BLACK-SCHOLES SYNC ---
-def sync_input(slider_val, input_val):
-    trigger_id = ctx.triggered_id
-    if trigger_id and 'slider' in trigger_id: return slider_val, no_update
-    return no_update, input_val
-
-@app.callback([Output('spot-input', 'value', allow_duplicate=True), Output('spot-slider', 'value', allow_duplicate=True)],
-              [Input('spot-slider', 'value'), Input('spot-input', 'value')], prevent_initial_call=True)
-def sync_spot_ui(s, b): return sync_input(s, b)
-
-@app.callback([Output('strike-input', 'value', allow_duplicate=True), Output('strike-slider', 'value', allow_duplicate=True)],
-              [Input('strike-slider', 'value'), Input('strike-input', 'value')], prevent_initial_call=True)
-def sync_strike_ui(s, b): return sync_input(s, b)
-
-@app.callback([Output('time-input', 'value'), Output('time-slider', 'value')], [Input('time-slider', 'value'), Input('time-input', 'value')])
-def sync_time(s, b): return sync_input(s, b)
-@app.callback([Output('vol-input', 'value'), Output('vol-slider', 'value')], [Input('vol-slider', 'value'), Input('vol-input', 'value')])
-def sync_vol(s, b): return sync_input(s, b)
-@app.callback([Output('rate-input', 'value'), Output('rate-slider', 'value')], [Input('rate-slider', 'value'), Input('rate-input', 'value')])
-def sync_rate(s, b): return sync_input(s, b)
-
-# CHANGE: Added Greeks summary cards output alongside call/put prices
-@app.callback(
-    [Output('call-price-display', 'children'), Output('put-price-display', 'children'),
-     Output('payoff-graph', 'figure'), Output('greeks-graph', 'figure'),
-     Output('greeks-delta-card', 'children'), Output('greeks-gamma-card', 'children'),
-     Output('greeks-theta-card', 'children'), Output('greeks-vega-card', 'children')],
-    [Input('spot-input', 'value'), Input('strike-input', 'value'), Input('time-input', 'value'), Input('vol-input', 'value'), Input('rate-input', 'value')]
-)
-def calc_bs(S, K, T, r, sigma):
-    if None in [S, K, T, r, sigma]: return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
-    call = black_scholes(S, K, T, r, sigma, 'call')
-    put = black_scholes(S, K, T, r, sigma, 'put')
-    fig_spot, fig_greeks = get_bs_charts(S, K, T, r, sigma)
-
-    # CHANGE: Calculate current Greeks for the summary cards
-    delta, gamma, theta, vega = calculate_greeks(S, K, T, r, sigma, 'call')
-
-    def greek_card_content(name, value, fmt=".4f"):
-        return [
-            html.Div(name, style={'color': colors['muted'], 'fontSize': '0.7em', 'textTransform': 'uppercase'}),
-            html.Div(f"{value:{fmt}}", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '1em'})
-        ]
-
-    return (
-        f"${call:.2f}", f"${put:.2f}", fig_spot, fig_greeks,
-        greek_card_content("Delta", delta),
-        greek_card_content("Gamma", gamma),
-        greek_card_content("Theta", theta),
-        greek_card_content("Vega", vega),
-    )
 
 # --- CALENDAR RETURNS CALLBACK ---
 @app.callback(
