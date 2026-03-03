@@ -5,3 +5,4 @@ yfinance
 scipy
 numpy
 gunicorn
+polygon-api-client
