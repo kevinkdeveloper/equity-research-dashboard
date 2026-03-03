@@ -5,4 +5,4 @@ yfinance
 scipy
 numpy
 gunicorn
-polygon-api-client
+polygon-api-client==1.14.3
