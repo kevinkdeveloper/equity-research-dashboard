@@ -17,12 +17,6 @@ try:
 except ImportError:
     POLYGON_AVAILABLE = False
 
-try:
-    from ib_insync import IB, Stock, Option
-    IBKR_AVAILABLE = True
-except ImportError:
-    IBKR_AVAILABLE = False
-
 
 # -----------------------------------------------------------------------------
 # 1. SETTINGS & DEFAULTS
@@ -301,6 +295,15 @@ def scan_ticker(ticker_symbol):
         hv_rank = ((current_hv - hv_min) / (hv_max - hv_min) * 100) if hv_max > hv_min else 50.0
         spot = closes[-1]
 
+        # get_previous_close_agg gives the actual last trading day's close;
+        # list_aggs can return data several days stale on this plan.
+        try:
+            prev = client.get_previous_close_agg(ticker_symbol.upper())
+            if prev and prev[0].close and prev[0].close > 0:
+                spot = prev[0].close
+        except Exception:
+            pass
+
         # --- Options chain snapshot ---
         current_iv, skew_ratio, pc_vol_ratio = None, None, None
         try:
@@ -311,12 +314,6 @@ def scan_ticker(ticker_symbol):
             contracts = []
 
         if contracts:
-            # Use spot from options chain if available (more current than last close)
-            for c in contracts:
-                if c.underlying_asset and c.underlying_asset.price:
-                    spot = c.underlying_asset.price
-                    break
-
             # Find nearest expiry >= 7 days out
             valid_exps = sorted({
                 c.details.expiration_date for c in contracts
@@ -398,178 +395,11 @@ def scan_ticker(ticker_symbol):
         return {'Ticker': ticker_symbol, '_error': str(e)}
 
 
-_scanner_client_id = 30   # cycles 30-49, separate range from vol surface (10-29)
-
-def scan_all_ibkr(tickers, market_open=True, host='127.0.0.1', port=4001):
-    """Scan all tickers sequentially over a single IBKR connection.
-    Returns (rows_list, error_string)."""
-    if not IBKR_AVAILABLE:
-        return [], "ib_insync not installed. Run: pip install ib_insync"
-
-    import asyncio, math
-    from scipy.optimize import brentq
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_closed(): raise RuntimeError
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
-    def _valid(p):
-        return p is not None and not (isinstance(p, float) and math.isnan(p)) and p > 0
-
-    def _calc_iv(S, K, T, price, right):
-        """BS IV inversion — works without live greeks."""
-        if not (_valid(S) and _valid(K) and T > 0 and _valid(price)):
-            return None
-        intrinsic = max(0.0, S - K) if right == 'C' else max(0.0, K - S)
-        if price <= intrinsic:
-            return None
-        try:
-            obj = lambda sigma: black_scholes(S, K, T, 0.045, sigma,
-                                              'call' if right == 'C' else 'put') - price
-            if obj(0.001) * obj(20.0) >= 0:
-                return None
-            return brentq(obj, 0.001, 20.0, xtol=1e-6, maxiter=100)
-        except Exception:
-            return None
-
-    def _parse_exp(e):
-        if len(e) == 8:   # YYYYMMDD
-            return datetime.date(int(e[:4]), int(e[4:6]), int(e[6:8]))
-        return datetime.date.fromisoformat(e)
-
-    global _scanner_client_id
-    _scanner_client_id = (_scanner_client_id % 20) + 30
-
-    ib = IB()
-    try:
-        ib.connect(host, port, clientId=_scanner_client_id, timeout=15)
-    except Exception as e:
-        return [], f"Cannot connect to IB Gateway ({host}:{port}): {e}"
-
-    rows  = []
-    today = datetime.date.today()
-
-    try:
-        for sym in tickers:
-            try:
-                stock = Stock(sym, 'SMART', 'USD')
-                ib.qualifyContracts(stock)
-
-                # --- HV: always compute from daily closes (reliable after hours) ---
-                price_bars = ib.reqHistoricalData(
-                    stock, endDateTime='', durationStr='1 Y',
-                    barSizeSetting='1 day', whatToShow='TRADES',
-                    useRTH=True, formatDate=1)
-                closes = np.array([b.close for b in (price_bars or []) if _valid(b.close)])
-                if len(closes) < 32:
-                    rows.append({'Ticker': sym, '_error': 'insufficient price history for HV'})
-                    continue
-                log_rets = np.log(closes[1:] / closes[:-1])
-                hv_vals  = [np.std(log_rets[i-29:i+1], ddof=1) * np.sqrt(252) * 100
-                            for i in range(29, len(log_rets))]
-
-                current_hv = hv_vals[-1]
-                hv_min, hv_max = min(hv_vals), max(hv_vals)
-                hv_rank = (current_hv - hv_min) / (hv_max - hv_min) * 100 if hv_max > hv_min else 50.0
-
-                spot = closes[-1]   # already have this from the 1Y TRADES fetch
-                current_iv = None   # filled from ATM skew below
-
-                # --- Skew: ATM call vs 90% put for nearest expiry ---
-                skew_ratio = None
-                if spot:
-                    chains = ib.reqSecDefOptParams(stock.symbol, '', stock.secType, stock.conId)
-                    if chains:
-                        chain = next((c for c in chains if c.exchange == 'SMART'), chains[0])
-                        near_exps = sorted([
-                            e for e in chain.expirations
-                            if 7 <= (_parse_exp(e) - today).days <= 60
-                        ])
-                        if near_exps:
-                            exp = near_exps[0]
-                            exp_date = _parse_exp(exp)
-                            dte = (exp_date - today).days
-                            T   = dte / 365.0
-                            strikes = sorted(chain.strikes)
-                            atm_k = min(strikes, key=lambda k: abs(k - spot))
-                            put_k  = min(strikes, key=lambda k: abs(k - spot * 0.90))
-                            # exchange='' lets IBKR resolve the right exchange
-                            # (needed for GLD/SLV/TLT which list on AMEX/CBOE, not SMART)
-                            opts = [Option(sym, exp, atm_k, 'C', ''),
-                                    Option(sym, exp, put_k,  'P', '')]
-                            try:
-                                ib.qualifyContracts(*opts)
-                            except Exception:
-                                pass
-                            opts = [o for o in opts if o.conId]
-                            if opts:
-                                if not market_open:
-                                    ib.reqMarketDataType(2)
-                                opt_tickers = ib.reqTickers(*opts)
-                                if not market_open:
-                                    ib.reqMarketDataType(1)
-                                atm_iv = put_iv = None
-                                for ot in opt_tickers:
-                                    right = ot.contract.right
-                                    k     = float(ot.contract.strike)
-                                    # Try mid → close → last (mid works even in frozen mode)
-                                    mid = ((ot.bid + ot.ask) / 2
-                                           if _valid(ot.bid) and _valid(ot.ask) else None)
-                                    price = (mid or
-                                             (ot.close if _valid(ot.close) else None) or
-                                             (ot.last  if _valid(ot.last)  else None))
-                                    iv = _calc_iv(spot, k, T, price, right)
-                                    if iv is not None:
-                                        iv_pct = iv * 100
-                                        if right == 'C': atm_iv = iv_pct
-                                        else:            put_iv  = iv_pct
-                                if atm_iv:
-                                    current_iv = current_iv or atm_iv
-                                if atm_iv and put_iv:
-                                    skew_ratio = put_iv / atm_iv
-
-                vrp = (current_iv / current_hv) if current_iv and current_hv else None
-
-                # Bias from skew only (P/C vol requires full chain)
-                bias = ('Bearish' if skew_ratio is not None and skew_ratio > 1.15
-                        else 'Bullish' if skew_ratio is not None and skew_ratio < 0.88
-                        else 'Neutral')
-
-                iv_cheap     = vrp is not None and vrp < 0.85
-                iv_expensive = vrp is not None and vrp > 1.25
-                call_rec = ('Buy'  if bias == 'Bullish' and iv_cheap     else
-                            'Sell' if bias == 'Bearish' and iv_expensive  else 'Hold')
-                put_rec  = ('Buy'  if bias == 'Bearish' and iv_cheap     else
-                            'Sell' if bias == 'Bullish' and iv_expensive  else 'Hold')
-
-                rows.append({
-                    'Ticker':   sym,
-                    'Price':    f"${spot:.2f}",
-                    'IV %':     f"{current_iv:.1f}"  if current_iv  else 'N/A',
-                    'HV %':     f"{current_hv:.1f}",
-                    'IV/HV':    f"{vrp:.2f}x"        if vrp         else 'N/A',
-                    'Skew':     f"{skew_ratio:.2f}x" if skew_ratio  else 'N/A',
-                    'P/C Vol':  'N/A',
-                    'HV Rank':  f"{hv_rank:.0f}%",
-                    'Bias':     bias,
-                    'Call Rec': call_rec,
-                    'Put Rec':  put_rec,
-                })
-
-            except Exception as e:
-                rows.append({'Ticker': sym, '_error': str(e)})
-
-    finally:
-        ib.disconnect()
-
-    return rows, None
-
-
 # -----------------------------------------------------------------------------
 # 3. APP LAYOUT & STYLES (Mobile Optimized)
 # -----------------------------------------------------------------------------
 app = dash.Dash(__name__, suppress_callback_exceptions=True, title='Equity Research Dashboard',
+                update_title=None,
                 meta_tags=[{"name": "viewport", "content": "width=device-width, initial-scale=1"}])
 server = app.server
 
@@ -875,13 +705,6 @@ vol_surface_layout = html.Div([
             html.Div(style={'display': 'flex', 'flexDirection': 'column', 'gap': '6px', 'marginTop': '6px'}, children=[
                 html.Button('Fetch  (Polygon)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
             ]),
-            html.Div(id='vol-timer-display',
-                     style={'color': colors['muted'], 'fontSize': '0.8em',
-                            'fontFamily': 'monospace', 'marginTop': '4px',
-                            'minHeight': '1.1em'}),
-            dcc.Interval(id='vol-timer-interval', interval=200, n_intervals=0, disabled=True),
-            dcc.Store(id='vol-start-time',  data=None),
-            dcc.Store(id='vol-end-time',    data=None),
             html.Hr(className='section-divider'),
             html.Div(id='vol-info-display', children=html.Div([
                 html.P("Surface data will appear here after fetch.", style={'color': colors['muted'], 'fontStyle': 'italic'})
@@ -958,21 +781,8 @@ scanner_layout = html.Div([
 
             html.Hr(className='section-divider'),
 
-            html.Div(style={'display': 'flex', 'gap': '8px', 'marginTop': '10px'}, children=[
-                html.Button('Live Scan (IBKR)', id='scanner-ibkr-btn', n_clicks=0,
-                            style={**BUTTON_STYLE, 'flex': '1', 'backgroundColor': '#1a472a', 'borderColor': '#2d6a4f'}),
-                html.Button('Scan  (Polygon)', id='scanner-polygon-btn', n_clicks=0,
-                            style={**BUTTON_STYLE, 'flex': '1'}),
-            ]),
-            html.Div(id='scan-timer-display',
-                     style={'color': colors['muted'], 'fontSize': '0.8em',
-                            'fontFamily': 'monospace', 'marginTop': '4px',
-                            'minHeight': '1.1em'}),
-            dcc.Interval(id='scan-timer-interval', interval=200, n_intervals=0, disabled=True),
-            dcc.Store(id='scan-start-time', data=None),
-            dcc.Store(id='scan-end-time',   data=None),
-            dcc.Store(id='scanner-source-store', data='ibkr'),
-
+            html.Button('Scan (Polygon)', id='scanner-polygon-btn', n_clicks=0,
+                        style={**BUTTON_STYLE, 'marginTop': '10px'}),
             html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.8em', 'fontStyle': 'italic', 'marginTop': '4px'}),
 
         ]),
@@ -1348,52 +1158,10 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
     return fig, info_html, smile_marks, max(0, len(sorted_exps) - 1)
 
 
-app.clientside_callback(
-    "function(a) { return Date.now() / 1000.0; }",
-    Output('vol-start-time', 'data'),
-    Input('vol-submit-btn', 'n_clicks'),
-    prevent_initial_call=True,
-)
-
-
-# Enable interval on button click, disable it when fetch completes
-app.clientside_callback(
-    """
-    function(a, end_time) {
-        const ctx = dash_clientside.callback_context;
-        if (!ctx.triggered.length) return window.dash_clientside.no_update;
-        if (ctx.triggered[0].prop_id === 'vol-end-time.data') return true;
-        return false;
-    }
-    """,
-    Output('vol-timer-interval', 'disabled'),
-    [Input('vol-submit-btn', 'n_clicks'),
-     Input('vol-end-time', 'data')],
-    prevent_initial_call=True,
-)
-
-# Update display on every tick AND when end-time arrives (so final value shows after interval stops)
-app.clientside_callback(
-    """
-    function(n, end_time, start) {
-        if (!start) return '';
-        if (end_time !== null && end_time !== undefined && end_time >= start)
-            return '\u2713 ' + (end_time - start).toFixed(1) + 's';
-        return '\u23f1 ' + (Date.now() / 1000.0 - start).toFixed(1) + 's';
-    }
-    """,
-    Output('vol-timer-display', 'children'),
-    [Input('vol-timer-interval', 'n_intervals'), Input('vol-end-time', 'data')],
-    State('vol-start-time', 'data'),
-)
-
-
-
 @app.callback(
     [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children'),
      Output('vol-data-store', 'data'), Output('vol-smile-expiry', 'marks'),
-     Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value'),
-     Output('vol-end-time', 'data')],
+     Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value')],
     [Input('vol-submit-btn', 'n_clicks'),
      Input('vol-plot-type', 'value'),
      Input('vol-z-axis', 'value')],
@@ -1433,15 +1201,15 @@ def update_vol_surface(_n_poly, plot_type, z_axis, ticker_symbol, contract_type,
             html.Div(f"{source_label} fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
             html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
         ])
-        return empty_fig, info, no_update, no_update, no_update, no_update, time.time()
+        return empty_fig, info, no_update, no_update, no_update, no_update
 
     fig, info_html, smile_marks, smile_max = _build_surface_figure(
         data, sym, contract_type, z_axis, plot_type, moneyness_pct)
     if fig is None:
         return empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
                                    style={'color': colors['danger']}), \
-               no_update, no_update, no_update, no_update, time.time()
-    return fig, info_html, data, smile_marks, smile_max, 0, time.time()
+               no_update, no_update, no_update, no_update
+    return fig, info_html, data, smile_marks, smile_max, 0
 
 
 # --- VOL SMILE SLICE CALLBACK ---
@@ -1883,87 +1651,19 @@ def run_calendar(_n_clicks, ticker_raw, slider_val):
 
 # --- SCANNER CALLBACK ---
 
-
-# Clientside: record scan start time the instant a button is clicked (no server round-trip)
-app.clientside_callback(
-    "function(a, b) { return Date.now() / 1000.0; }",
-    Output('scan-start-time', 'data'),
-    [Input('scanner-ibkr-btn', 'n_clicks'), Input('scanner-polygon-btn', 'n_clicks')],
-    prevent_initial_call=True,
-)
-
-
-# Enable interval on button click, disable it when scan completes
-app.clientside_callback(
-    """
-    function(a, b, end_time) {
-        const ctx = dash_clientside.callback_context;
-        if (!ctx.triggered.length) return window.dash_clientside.no_update;
-        if (ctx.triggered[0].prop_id === 'scan-end-time.data') return true;
-        return false;
-    }
-    """,
-    Output('scan-timer-interval', 'disabled'),
-    [Input('scanner-ibkr-btn', 'n_clicks'), Input('scanner-polygon-btn', 'n_clicks'),
-     Input('scan-end-time', 'data')],
-    prevent_initial_call=True,
-)
-
-# Update display on every tick AND when end-time arrives
-app.clientside_callback(
-    """
-    function(n, end_time, start) {
-        if (!start) return '';
-        if (end_time !== null && end_time !== undefined && end_time >= start)
-            return '\u2713 ' + (end_time - start).toFixed(1) + 's';
-        return '\u23f1 ' + (Date.now() / 1000.0 - start).toFixed(1) + 's';
-    }
-    """,
-    Output('scan-timer-display', 'children'),
-    [Input('scan-timer-interval', 'n_intervals'), Input('scan-end-time', 'data')],
-    State('scan-start-time', 'data'),
-)
-
-
 @app.callback(
-    Output('scanner-source-store', 'data'),
-    [Input('scanner-ibkr-btn', 'n_clicks'), Input('scanner-polygon-btn', 'n_clicks')],
-    prevent_initial_call=True
-)
-def update_scanner_source(*_):
-    return 'polygon' if ctx.triggered_id == 'scanner-polygon-btn' else 'ibkr'
-
-
-@app.callback(
-    [Output('scanner-results-table', 'children'), Output('scanner-status', 'children'),
-     Output('scan-end-time', 'data')],
-    [Input('scanner-ibkr-btn', 'n_clicks'),
-     Input('scanner-polygon-btn', 'n_clicks')],
+    [Output('scanner-results-table', 'children'), Output('scanner-status', 'children')],
+    Input('scanner-polygon-btn', 'n_clicks'),
     State('scanner-tickers-input', 'value'),
     prevent_initial_call=True
 )
-def run_scanner(_n_ibkr, _n_polygon, tickers_raw):
+def run_scanner(_n, tickers_raw):
     if not tickers_raw:
-        return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), "", time.time()
+        return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), ""
 
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    now_et  = now_utc - datetime.timedelta(hours=4)   # EDT approx
-    market_open = now_et.weekday() < 5 and datetime.time(9, 30) <= now_et.time() <= datetime.time(16, 0)
     tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
-
-    use_ibkr = ctx.triggered_id == 'scanner-ibkr-btn'
-
-    if use_ibkr:
-        results, conn_err = scan_all_ibkr(tickers, market_open=market_open)
-        if conn_err:
-            return html.Div([
-                html.Div("IBKR connection failed.", style={'color': colors['danger'], 'fontWeight': 'bold', 'padding': '20px 20px 4px'}),
-                html.Div(conn_err, style={'color': colors['muted'], 'padding': '0 20px 20px', 'fontSize': '0.85em'}),
-            ]), "", time.time()
-        source_label = 'IBKR'
-    else:
-        results = [scan_ticker(t) for t in tickers]
-        source_label = 'Polygon'
+    results = [scan_ticker(t) for t in tickers]
+    source_label = 'Polygon'
 
     errors = [r for r in results if r and '_error' in r]
     rows   = [r for r in results if r and '_error' not in r]
@@ -1973,7 +1673,7 @@ def run_scanner(_n_ibkr, _n_polygon, tickers_raw):
         return html.Div([
             html.Div("Scanner failed — no data returned.", style={'color': colors['danger'], 'fontWeight': 'bold', 'padding': '20px 20px 4px'}),
             html.Div(f"First error: {err_msg}", style={'color': colors['muted'], 'padding': '0 20px 20px', 'fontSize': '0.85em'}),
-        ]), "", time.time()
+        ]), ""
 
     col_order = ['Ticker', 'Price', 'IV %', 'HV %', 'IV/HV', 'Skew', 'P/C Vol', 'HV Rank', 'Bias', 'Call Rec', 'Put Rec']
 
@@ -2049,12 +1749,10 @@ def run_scanner(_n_ibkr, _n_polygon, tickers_raw):
         tooltip_delay=0,
         tooltip_duration=None,
     )
+    now_et   = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
     ts       = now_et.strftime('%H:%M:%S')
-    mkt_note = ' · Market open' if market_open else ' · Market closed'
-    is_live  = ctx.triggered_id == 'scanner-interval'
-    status   = (f"● Live ({source_label}) · {ts} ET{mkt_note}" if is_live
-                else f"Scanned {len(rows)}/{len(tickers)} via {source_label} · {ts} ET{mkt_note}")
-    return table, status, time.time()
+    status   = f"Scanned {len(rows)}/{len(tickers)} via {source_label} · {ts} ET"
+    return table, status
 
 
 
