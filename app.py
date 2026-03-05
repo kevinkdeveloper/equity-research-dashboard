@@ -9,6 +9,7 @@ import plotly.colors as pc
 from plotly.subplots import make_subplots
 import numpy as np
 from scipy.interpolate import griddata
+from scipy.stats import norm
 import yfinance as yf
 import pandas as pd
 import datetime
@@ -114,6 +115,23 @@ def generate_vol_signals(current_iv, current_hv, rvr, skew_ratio, term_slope):
     return signals
 
 
+
+
+def bs_greeks_atm(spot, iv_pct, T_days, r=0.04):
+    """Black-Scholes ATM greeks (per share). Returns dict with delta, gamma, vega, theta or None."""
+    sigma = iv_pct / 100.0
+    T = T_days / 365.0
+    if T <= 0 or sigma <= 0 or spot <= 0:
+        return None
+    d1 = (r / sigma + 0.5 * sigma) * np.sqrt(T)
+    d2 = d1 - sigma * np.sqrt(T)
+    nd1 = norm.pdf(d1)
+    delta = norm.cdf(d1)                                          # call delta
+    gamma = nd1 / (spot * sigma * np.sqrt(T))
+    vega  = spot * nd1 * np.sqrt(T) / 100.0                      # per 1% IV move
+    theta = (-spot * nd1 * sigma / (2 * np.sqrt(T))
+             - r * spot * np.exp(-r * T) * norm.cdf(d2)) / 365.0 # per calendar day
+    return {'delta': delta, 'gamma': gamma, 'vega': vega, 'theta': theta}
 
 
 def fetch_orats_surface(ticker_symbol, contract_type, moneyness_pct):
@@ -336,44 +354,53 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         d = data[0]
         spot   = d.get('stockPrice')
         atm_iv = d.get('iv30d')   # 30-day ATM implied vol (decimal)
-        hv20   = d.get('rVol30')  # 30-day realized vol (decimal)
+        hv30   = d.get('rVol30')  # 30-day realized vol (decimal)
+        iv60d_raw = d.get('iv60d')
 
-        if not spot or not atm_iv or not hv20:
-            missing = [k for k, v in [('stockPrice', spot), ('iv30d', atm_iv), ('rVol30', hv20)] if not v]
+        if not spot or not atm_iv or not hv30:
+            missing = [k for k, v in [('stockPrice', spot), ('iv30d', atm_iv), ('rVol30', hv30)] if not v]
             return {'Ticker': ticker_symbol, '_error': f'Missing fields: {missing}'}
 
         current_iv = atm_iv * 100
-        current_hv = hv20   * 100
+        current_hv = hv30   * 100
+        iv60d_pct  = iv60d_raw * 100 if iv60d_raw else None
         vrp_ratio  = current_iv / current_hv if current_hv else None
 
-        # Skew: 25-delta put IV / 75-delta call IV (both already in summaries)
+        # Term structure: 60d IV / 30d IV
+        term_struct = (iv60d_pct / current_iv) if (iv60d_pct and current_iv) else None
+
+        # Expected move: 30-day 1-sigma
+        exp_move_pct = current_iv * np.sqrt(30 / 365)
+
+        # Skew: 25-delta put IV / 75-delta call IV
         put_iv_d25  = d.get('dlt25Iv30d')
         call_iv_d75 = d.get('dlt75Iv30d')
         skew_ratio  = (put_iv_d25 / call_iv_d75) if (put_iv_d25 and call_iv_d75 and call_iv_d75 > 0) else None
 
-        verdict = ('Expensive' if vrp_ratio and vrp_ratio > 1.25
-                   else 'Cheap' if vrp_ratio and vrp_ratio < 0.80
-                   else 'Neutral' if vrp_ratio else 'N/A')
+        # ATM 30d Greeks (per share)
+        greeks = bs_greeks_atm(spot, current_iv, 30)
 
-        # Supplement with yfinance: P/C vol from options chain + HV rank from price history
+        # Supplement with yfinance: P/C vol + OI from options chain, HV rank from price history
         pc_vol_ratio = None
+        pc_oi_ratio  = None
         hv_rank_val  = None
         try:
-            import yfinance as yf
             tkr  = yf.Ticker(ticker_symbol)
             exps = tkr.options
             if exps:
-                chain     = tkr.option_chain(exps[0])
-                c_vol     = chain.calls['volume'].sum()
-                p_vol     = chain.puts['volume'].sum()
+                chain = tkr.option_chain(exps[0])
+                c_vol = chain.calls['volume'].sum()
+                p_vol = chain.puts['volume'].sum()
                 pc_vol_ratio = p_vol / c_vol if c_vol > 0 else None
+                c_oi = chain.calls['openInterest'].sum()
+                p_oi = chain.puts['openInterest'].sum()
+                pc_oi_ratio = p_oi / c_oi if c_oi > 0 else None
             hist = tkr.history(period='1y')
             if len(hist) > 25:
-                log_ret    = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
-                roll_hv    = log_ret.rolling(20).std() * np.sqrt(252) * 100
-                roll_hv    = roll_hv.dropna()
-                cur_hv     = roll_hv.iloc[-1]
-                hv_rank_val = (roll_hv < cur_hv).mean() * 100
+                log_ret     = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+                roll_hv     = log_ret.rolling(20).std() * np.sqrt(252) * 100
+                roll_hv     = roll_hv.dropna()
+                hv_rank_val = (roll_hv < roll_hv.iloc[-1]).mean() * 100
         except Exception:
             pass
 
@@ -392,19 +419,48 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         put_rec  = ("Buy"  if bias == "Bearish" and iv_cheap
                     else "Sell" if bias == "Bullish" and iv_expensive else "Hold")
 
+        # Short vega signal
+        if vrp_ratio and hv_rank_val is not None:
+            if vrp_ratio > 1.25 and hv_rank_val > 60:
+                short_vol = 'Strong Sell'
+            elif vrp_ratio > 1.15 and hv_rank_val > 40:
+                short_vol = 'Sell'
+            elif vrp_ratio < 0.85 and hv_rank_val < 40:
+                short_vol = 'Buy Vol'
+            else:
+                short_vol = 'Neutral'
+        elif vrp_ratio:
+            short_vol = 'Sell' if vrp_ratio > 1.25 else ('Buy Vol' if vrp_ratio < 0.85 else 'Neutral')
+        else:
+            short_vol = 'N/A'
+
+        tv_ratio = abs(greeks['theta'] / greeks['vega']) if (greeks and greeks['vega']) else None
+
         return {
-            'Ticker':   ticker_symbol,
-            'Price':    f"${spot:.2f}",
-            'IV %':     f"{current_iv:.1f}",
-            'HV %':     f"{current_hv:.1f}",
-            'IV/HV':    f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
-            'Skew':     f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
-            'P/C Vol':  f"{pc_vol_ratio:.2f}" if pc_vol_ratio is not None else 'N/A',
-            'HV Rank':  f"{hv_rank_val:.0f}%" if hv_rank_val is not None else 'N/A',
-            'Bias':     bias,
-            'Call Rec': call_rec,
-            'Put Rec':  put_rec,
-            'Verdict':  verdict,
+            'Ticker':      ticker_symbol,
+            'Price':       f"${spot:.2f}",
+            # Vol / VRP tab
+            'IV %':        f"{current_iv:.1f}",
+            'HV %':        f"{current_hv:.1f}",
+            'IV/HV':       f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
+            'HV Rank':     f"{hv_rank_val:.0f}%" if hv_rank_val is not None else 'N/A',
+            'Term Struct': f"{term_struct:.2f}x" if term_struct else 'N/A',
+            'Exp Move':    f"±{exp_move_pct:.1f}%",
+            # Positioning tab
+            'Skew':        f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
+            'P/C Vol':     f"{pc_vol_ratio:.2f}" if pc_vol_ratio is not None else 'N/A',
+            'P/C OI':      f"{pc_oi_ratio:.2f}"  if pc_oi_ratio  is not None else 'N/A',
+            'Bias':        bias,
+            # Greeks tab (ATM 30d, per share)
+            'Delta':       f"{greeks['delta']:.3f}"  if greeks else 'N/A',
+            'Gamma':       f"{greeks['gamma']:.4f}"  if greeks else 'N/A',
+            'Vega':        f"${greeks['vega']:.2f}"  if greeks else 'N/A',
+            'Theta':       f"${greeks['theta']:.2f}" if greeks else 'N/A',
+            'Θ/V':         f"{tv_ratio:.3f}"         if tv_ratio is not None else 'N/A',
+            # Signals tab
+            'Short Vol':   short_vol,
+            'Call Rec':    call_rec,
+            'Put Rec':     put_rec,
         }
     except requests.exceptions.Timeout:
         return {'Ticker': ticker_symbol, '_error': 'ORATS request timed out'}
@@ -719,6 +775,23 @@ scanner_layout = html.Div([
 
         ]),
         html.Div(style=CONTENT_STYLE, children=[
+            dcc.Store(id='scanner-data-store'),
+            dcc.Tabs(id='scanner-view-tabs', value='tab-scan-vol',
+                     style={'marginBottom': '10px'},
+                     children=[
+                dcc.Tab(label='Vol / VRP', value='tab-scan-vol',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+                dcc.Tab(label='Positioning', value='tab-scan-pos',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+                dcc.Tab(label='Greeks', value='tab-scan-greeks',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+                dcc.Tab(label='Signals', value='tab-scan-signals',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+            ]),
             dcc.Loading(html.Div(id='scanner-results-table'), type='circle'),
         ])
     ])
@@ -794,7 +867,18 @@ vol_analysis_layout = html.Div([
         ]),
 
         html.Div(style=CONTENT_STYLE, children=[
-            dcc.Loading(dcc.Graph(id='vola-chart', style={'height': '75vh', 'minHeight': '500px'}), type='circle'),
+            dcc.Store(id='vola-data-store'),
+            dcc.Tabs(id='vola-view-tabs', value='tab-vola-iv',
+                     style={'marginBottom': '10px'},
+                     children=[
+                dcc.Tab(label='IV / HV', value='tab-vola-iv',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+                dcc.Tab(label='Greeks History', value='tab-vola-greeks',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
+            ]),
+            dcc.Loading(dcc.Graph(id='vola-chart', style={'height': '72vh', 'minHeight': '480px'}), type='circle'),
         ])
     ])
 ])
@@ -1384,124 +1468,194 @@ def run_calendar(_n_clicks, ticker_raw, slider_val):
         return html.Div(f"Error: {e}", style={'color': colors['danger']}), html.Div()
 
 
-# --- SCANNER CALLBACK ---
+# --- SCANNER CALLBACKS ---
 
 @app.callback(
-    [Output('scanner-results-table', 'children'), Output('scanner-status', 'children')],
+    [Output('scanner-data-store', 'data'), Output('scanner-status', 'children')],
     Input('scanner-polygon-btn', 'n_clicks'),
     State('scanner-tickers-input', 'value'),
     prevent_initial_call=True
 )
 def run_scanner(_n, tickers_raw):
     if not tickers_raw:
-        return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), ""
-
+        return None, ""
     tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
     results = [scan_ticker_orats(t) for t in tickers]
-    source_label = 'ORATS'
-
-    errors = [r for r in results if r and '_error' in r]
-    rows   = [r for r in results if r and '_error' not in r]
-
+    errors  = [r for r in results if r and '_error' in r]
+    rows    = [r for r in results if r and '_error' not in r]
     if not rows:
         err_msg = errors[0]['_error'] if errors else "all tickers returned no data"
+        return {'error': err_msg}, ""
+    now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
+    status = f"Scanned {len(rows)}/{len(tickers)} via ORATS · {now_et.strftime('%H:%M:%S')} ET"
+    return {'rows': rows}, status
+
+
+@app.callback(
+    Output('scanner-results-table', 'children'),
+    [Input('scanner-data-store', 'data'), Input('scanner-view-tabs', 'value')],
+)
+def render_scanner_table(data, tab_value):
+    if not data:
+        return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'})
+    if 'error' in data:
         return html.Div([
             html.Div("Scanner failed — no data returned.", style={'color': colors['danger'], 'fontWeight': 'bold', 'padding': '20px 20px 4px'}),
-            html.Div(f"First error: {err_msg}", style={'color': colors['muted'], 'padding': '0 20px 20px', 'fontSize': '0.85em'}),
-        ]), ""
+            html.Div(f"First error: {data['error']}", style={'color': colors['muted'], 'padding': '0 20px 20px', 'fontSize': '0.85em'}),
+        ])
+    rows = data['rows']
 
-    col_order = ['Ticker', 'Price', 'IV %', 'HV %', 'IV/HV', 'Skew', 'P/C Vol', 'HV Rank', 'Bias', 'Call Rec', 'Put Rec']
-
-    # Per-row heatmap styles for IV/HV and Bias
-    bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
-    cell_styles = []
-    for i, row in enumerate(rows):
-        ivhv_str = row.get('IV/HV', 'N/A')
-        if ivhv_str != 'N/A':
-            try:
-                val = float(ivhv_str.replace('x', ''))
-                t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
-                bg = pc.sample_colorscale('RdYlGn', [t])[0]
-                cell_styles.append({'if': {'row_index': i, 'column_id': 'IV/HV'}, 'backgroundColor': bg, 'color': '#111'})
-            except Exception:
-                pass
-        skew_str = row.get('Skew', 'N/A')
-        if skew_str != 'N/A':
-            try:
-                val = float(skew_str.replace('x', ''))
-                t = 1.0 - max(0.0, min(1.0, (val - 0.75) / 0.5))
-                bg = pc.sample_colorscale('RdYlGn', [t])[0]
-                cell_styles.append({'if': {'row_index': i, 'column_id': 'Skew'}, 'backgroundColor': bg, 'color': '#111'})
-            except Exception:
-                pass
-        pc_str = row.get('P/C Vol', 'N/A')
-        if pc_str != 'N/A':
-            try:
-                val = float(pc_str)
-                t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
-                bg = pc.sample_colorscale('RdYlGn', [t])[0]
-                cell_styles.append({'if': {'row_index': i, 'column_id': 'P/C Vol'}, 'backgroundColor': bg, 'color': '#111'})
-            except Exception:
-                pass
-        t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
-        bg_bias = pc.sample_colorscale('RdYlGn', [t_bias])[0]
-        cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'}, 'backgroundColor': bg_bias, 'color': '#111', 'fontWeight': 'bold'})
-
-    table = dash_table.DataTable(
-        data=rows,
-        columns=[{'name': c, 'id': c} for c in col_order],
+    base_style = dict(
         style_table={'overflowX': 'auto'},
-        style_header={
-            'backgroundColor': '#1a1a1a', 'color': colors['accent'],
-            'fontWeight': 'bold', 'border': f"1px solid {colors['card_border']}", 'textAlign': 'center'
-        },
-        style_cell={
-            'backgroundColor': colors['card_bg'], 'color': colors['text'],
-            'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
-            'padding': '10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"
-        },
-        style_data_conditional=[
-            # Call Rec coloring
-            {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Call Rec} = "Hold"', 'column_id': 'Call Rec'}, 'color': colors['muted']},
-            # Put Rec coloring
-            {'if': {'filter_query': '{Put Rec} = "Buy"',   'column_id': 'Put Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Put Rec} = "Sell"',  'column_id': 'Put Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
-            {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'}, 'color': colors['muted']},
-            # Ticker highlight
-            {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']},
-            *cell_styles,
-        ],
+        style_header={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'fontWeight': 'bold',
+                      'border': f"1px solid {colors['card_border']}", 'textAlign': 'center'},
+        style_cell={'backgroundColor': colors['card_bg'], 'color': colors['text'],
+                    'border': f"1px solid {colors['card_border']}", 'textAlign': 'center',
+                    'padding': '10px', 'fontFamily': "'Segoe UI', Arial, sans-serif"},
         sort_action='native',
-        tooltip_header={
-            'Skew':    'OTM 90% put IV ÷ ATM call IV. >1.15 = bearish skew, <0.88 = bullish',
-            'P/C Vol': 'Total put volume ÷ total call volume. >1.10 = bearish, <0.75 = bullish',
-            'Bias':    'Directional vote from Skew + P/C Vol. Both must agree for Bullish/Bearish.',
-            'Call Rec':'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
-            'Put Rec': 'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
-        },
         tooltip_delay=0,
         tooltip_duration=None,
     )
-    now_et   = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
-    ts       = now_et.strftime('%H:%M:%S')
-    status   = f"Scanned {len(rows)}/{len(tickers)} via {source_label} · {ts} ET"
-    return table, status
+    ticker_style = {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']}
+    cell_styles  = []
+
+    if tab_value == 'tab-scan-vol':
+        col_order = ['Ticker', 'Price', 'IV %', 'HV %', 'IV/HV', 'HV Rank', 'Term Struct', 'Exp Move']
+        for i, row in enumerate(rows):
+            ivhv_str = row.get('IV/HV', 'N/A')
+            if ivhv_str != 'N/A':
+                try:
+                    val = float(ivhv_str.replace('x', ''))
+                    t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
+                    cell_styles.append({'if': {'row_index': i, 'column_id': 'IV/HV'},
+                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                except Exception: pass
+            hvr_str = row.get('HV Rank', 'N/A')
+            if hvr_str != 'N/A':
+                try:
+                    val = float(hvr_str.replace('%', ''))
+                    t = 1.0 - val / 100.0
+                    cell_styles.append({'if': {'row_index': i, 'column_id': 'HV Rank'},
+                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                except Exception: pass
+            ts_str = row.get('Term Struct', 'N/A')
+            if ts_str != 'N/A':
+                try:
+                    val = float(ts_str.replace('x', ''))
+                    t = max(0.0, min(1.0, (val - 0.85) / 0.30))
+                    cell_styles.append({'if': {'row_index': i, 'column_id': 'Term Struct'},
+                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                except Exception: pass
+        return dash_table.DataTable(
+            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
+            style_data_conditional=[ticker_style, *cell_styles],
+            tooltip_header={
+                'IV/HV':       'IV ÷ HV (VRP). >1.25 = expensive vol, <0.80 = cheap vol',
+                'HV Rank':     'Percentile of current HV vs 1-year history. >70 = elevated realized vol',
+                'Term Struct': '60d IV ÷ 30d IV. >1 = contango (normal), <1 = backwardation (stress)',
+                'Exp Move':    '30-day 1σ expected move = IV × √(30/365)',
+            }, **base_style)
+
+    elif tab_value == 'tab-scan-pos':
+        col_order = ['Ticker', 'Price', 'Skew', 'P/C Vol', 'P/C OI', 'Bias']
+        bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
+        for i, row in enumerate(rows):
+            skew_str = row.get('Skew', 'N/A')
+            if skew_str != 'N/A':
+                try:
+                    val = float(skew_str.replace('x', ''))
+                    t = 1.0 - max(0.0, min(1.0, (val - 0.75) / 0.5))
+                    cell_styles.append({'if': {'row_index': i, 'column_id': 'Skew'},
+                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                except Exception: pass
+            for col_id in ('P/C Vol', 'P/C OI'):
+                pc_str = row.get(col_id, 'N/A')
+                if pc_str != 'N/A':
+                    try:
+                        val = float(pc_str)
+                        t = 1.0 - max(0.0, min(1.0, (val - 0.5) / 1.0))
+                        cell_styles.append({'if': {'row_index': i, 'column_id': col_id},
+                                            'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                    except Exception: pass
+            t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
+            cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'},
+                                'backgroundColor': pc.sample_colorscale('RdYlGn', [t_bias])[0],
+                                'color': '#111', 'fontWeight': 'bold'})
+        return dash_table.DataTable(
+            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
+            style_data_conditional=[ticker_style, *cell_styles],
+            tooltip_header={
+                'Skew':    '25Δ put IV ÷ 75Δ call IV. >1.15 = bearish fear, <0.88 = bullish complacency',
+                'P/C Vol': 'Put volume ÷ call volume (near-term). >1.10 = bearish flow',
+                'P/C OI':  'Put OI ÷ call OI (near-term). Persistent positioning vs intraday flow',
+                'Bias':    'Directional vote from Skew + P/C Vol',
+            }, **base_style)
+
+    elif tab_value == 'tab-scan-greeks':
+        col_order = ['Ticker', 'Price', 'Delta', 'Gamma', 'Vega', 'Theta', 'Θ/V']
+        for i, row in enumerate(rows):
+            cell_styles.append({'if': {'row_index': i, 'column_id': 'Theta'}, 'color': colors['put_text']})
+            tv_str = row.get('Θ/V', 'N/A')
+            if tv_str != 'N/A':
+                try:
+                    val = float(tv_str)
+                    t = max(0.0, min(1.0, val / 0.10))
+                    cell_styles.append({'if': {'row_index': i, 'column_id': 'Θ/V'},
+                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
+                except Exception: pass
+        return dash_table.DataTable(
+            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
+            style_data_conditional=[ticker_style, *cell_styles],
+            tooltip_header={
+                'Delta': 'ATM call delta (≈0.50). Directional exposure per share.',
+                'Gamma': 'Rate of delta change per $1 stock move. Per share.',
+                'Vega':  'P&L per 1% change in IV. Per share.',
+                'Theta': 'Daily time decay cost. Per share (negative = decay).',
+                'Θ/V':   '|Theta| ÷ Vega. Higher = more premium collected per unit of vol risk. Key for short vega sizing.',
+            }, **base_style)
+
+    else:  # tab-scan-signals
+        col_order = ['Ticker', 'Bias', 'Short Vol', 'Call Rec', 'Put Rec']
+        bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
+        for i, row in enumerate(rows):
+            t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
+            cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'},
+                                'backgroundColor': pc.sample_colorscale('RdYlGn', [t_bias])[0],
+                                'color': '#111', 'fontWeight': 'bold'})
+        return dash_table.DataTable(
+            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
+            style_data_conditional=[
+                ticker_style, *cell_styles,
+                {'if': {'filter_query': '{Short Vol} = "Strong Sell"', 'column_id': 'Short Vol'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Short Vol} = "Sell"',        'column_id': 'Short Vol'}, 'color': '#ff9944',           'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Short Vol} = "Buy Vol"',     'column_id': 'Short Vol'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Short Vol} = "Neutral"',     'column_id': 'Short Vol'}, 'color': colors['muted']},
+                {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Call Rec} = "Hold"', 'column_id': 'Call Rec'}, 'color': colors['muted']},
+                {'if': {'filter_query': '{Put Rec} = "Buy"',   'column_id': 'Put Rec'},  'color': colors['call_text'], 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Put Rec} = "Sell"',  'column_id': 'Put Rec'},  'color': colors['put_text'],  'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'},  'color': colors['muted']},
+            ],
+            tooltip_header={
+                'Short Vol': 'Short vega signal. Strong Sell: IV/HV>1.25 & HV Rank>60. Sell: IV/HV>1.15 & HV Rank>40.',
+                'Call Rec':  'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
+                'Put Rec':   'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
+            }, **base_style)
 
 
 
-# --- VOL ANALYSIS CALLBACK ---
+# --- VOL ANALYSIS CALLBACKS ---
+
 @app.callback(
-    [Output('vola-chart', 'figure'), Output('vola-stats-display', 'children')],
+    [Output('vola-data-store', 'data'), Output('vola-stats-display', 'children')],
     [Input('vola-analyze-btn', 'n_clicks')],
     [State('vola-ticker-input', 'value'), State('vola-period-slider', 'value')],
     prevent_initial_call=True
 )
 def update_vol_analysis(_n, ticker_symbol, slider_val):
-    empty_fig = go.Figure(layout=layout_settings)
     if not ticker_symbol:
-        return empty_fig, html.Div()
+        return None, html.Div()
 
     sym   = ticker_symbol.strip().upper()
     today = datetime.date.today()
@@ -1525,85 +1679,148 @@ def update_vol_analysis(_n, ticker_symbol, slider_val):
     start_date = _vola_date_map.get(start_idx)
     end_date   = _vola_date_map.get(end_idx, today)
 
-    # Fetch ORATS historical IV and filter by date range in Python
     df, err = fetch_orats_hist_iv(sym)
     if err:
-        return empty_fig, html.Div(err, style={'color': colors['danger'], 'padding': '10px'})
+        return {'error': err}, html.Div(err, style={'color': colors['danger'], 'padding': '10px'})
     if start_date:
         df = df[df['tradeDate'] >= pd.Timestamp(start_date)]
     if end_date and end_date != today:
         df = df[df['tradeDate'] <= pd.Timestamp(end_date)]
     df = df.reset_index(drop=True)
 
-    # Fetch stock price history from yfinance
     hist_kwargs = ({'start': start_date.isoformat(), 'end': (end_date + datetime.timedelta(days=1)).isoformat()}
                    if start_date else {'period': 'max'})
     price_series = yf.Ticker(sym).history(**hist_kwargs)['Close']
 
-    # Build 2-row subplot: price on top, IV + HV below
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.06,
-        subplot_titles=(f'{sym} Price', 'Implied & Realized Volatility (30d)'),
-        row_heights=[0.4, 0.6],
-    )
-
-    # Row 1: stock price
-    if not price_series.empty:
-        fig.add_trace(go.Scatter(
-            x=price_series.index, y=price_series.values,
-            mode='lines', name='Price',
-            line=dict(color='#ffffff', width=1.5),
-            hovertemplate='$%{y:.2f}<extra>Price</extra>',
-        ), row=1, col=1)
-
-    # Row 2: IV30d and RVol30
-    if 'iv30d' in df.columns:
-        fig.add_trace(go.Scatter(
-            x=df['tradeDate'], y=df['iv30d'] * 100,
-            mode='lines', name='IV 30d',
-            line=dict(color=colors['accent'], width=1.5),
-            hovertemplate='%{y:.1f}%<extra>IV 30d</extra>',
-        ), row=2, col=1)
-
-    if 'rVol30' in df.columns:
-        fig.add_trace(go.Scatter(
-            x=df['tradeDate'], y=df['rVol30'] * 100,
-            mode='lines', name='HV 30d',
-            line=dict(color='#00c8ff', width=1.5, dash='dot'),
-            hovertemplate='%{y:.1f}%<extra>HV 30d</extra>',
-        ), row=2, col=1)
-
-    fig.update_layout(
-        **layout_settings,
-        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
-        margin=dict(l=50, r=20, t=60, b=40),
-    )
-    fig.update_yaxes(title_text='Price ($)', tickprefix='$', row=1, col=1)
-    fig.update_yaxes(title_text='Vol (%)', ticksuffix='%', row=2, col=1)
-    fig.update_xaxes(showgrid=True, gridcolor='#222', row=2, col=1)
-
     # Stats panel
-    iv_latest  = df['iv30d'].iloc[-1]  * 100 if 'iv30d'  in df.columns and len(df) else None
-    hv_latest  = df['rVol30'].iloc[-1] * 100 if 'rVol30' in df.columns and len(df) else None
-    iv_max     = df['iv30d'].max()     * 100 if 'iv30d'  in df.columns else None
-    iv_min     = df['iv30d'].min()     * 100 if 'iv30d'  in df.columns else None
-    iv_rank    = ((iv_latest - iv_min) / (iv_max - iv_min) * 100
-                  if iv_latest and iv_max and iv_min and iv_max != iv_min else None)
-    vrp        = (iv_latest / hv_latest if iv_latest and hv_latest else None)
+    iv_latest = df['iv30d'].iloc[-1]  * 100 if 'iv30d'  in df.columns and len(df) else None
+    hv_latest = df['rVol30'].iloc[-1] * 100 if 'rVol30' in df.columns and len(df) else None
+    iv_max    = df['iv30d'].max()     * 100 if 'iv30d'  in df.columns else None
+    iv_min    = df['iv30d'].min()     * 100 if 'iv30d'  in df.columns else None
+    iv_rank   = ((iv_latest - iv_min) / (iv_max - iv_min) * 100
+                 if iv_latest and iv_max and iv_min and iv_max != iv_min else None)
+    vrp       = (iv_latest / hv_latest if iv_latest and hv_latest else None)
+    g_latest  = bs_greeks_atm(price_series.iloc[-1] if not price_series.empty else 100, iv_latest or 20, 30)
 
     stats = html.Div([
         html.H4(f"{sym} Vol Summary", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-        make_stat_row("IV 30d (latest)",  f"{iv_latest:.1f}%"        if iv_latest  else "N/A"),
-        make_stat_row("HV 30d (latest)",  f"{hv_latest:.1f}%"        if hv_latest  else "N/A"),
-        make_stat_row("IV/HV (VRP)",      f"{vrp:.2f}x"              if vrp        else "N/A"),
-        make_stat_row("IV Rank (period)", f"{iv_rank:.0f}%"          if iv_rank    else "N/A"),
-        make_stat_row("IV Range",         f"{iv_min:.1f}–{iv_max:.1f}%" if iv_min and iv_max else "N/A"),
+        make_stat_row("IV 30d (latest)",  f"{iv_latest:.1f}%"              if iv_latest  else "N/A"),
+        make_stat_row("HV 30d (latest)",  f"{hv_latest:.1f}%"              if hv_latest  else "N/A"),
+        make_stat_row("IV/HV (VRP)",      f"{vrp:.2f}x"                    if vrp        else "N/A"),
+        make_stat_row("IV Rank (period)", f"{iv_rank:.0f}%"                if iv_rank    else "N/A"),
+        make_stat_row("IV Range",         f"{iv_min:.1f}–{iv_max:.1f}%"    if iv_min and iv_max else "N/A"),
+        html.Hr(className='section-divider'),
+        html.H4("ATM Greeks (30d)", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
+        make_stat_row("Vega ($/1% IV)",   f"${g_latest['vega']:.2f}"       if g_latest   else "N/A"),
+        make_stat_row("Theta ($/day)",    f"${g_latest['theta']:.2f}"      if g_latest   else "N/A", colors['put_text'] if g_latest else None),
+        make_stat_row("Θ/V ratio",        f"{abs(g_latest['theta']/g_latest['vega']):.3f}" if (g_latest and g_latest['vega']) else "N/A"),
         make_stat_row("Data points",      str(len(df))),
     ])
 
-    return fig, stats
+    store = {
+        'sym': sym,
+        'iv_dates':    df['tradeDate'].dt.strftime('%Y-%m-%d').tolist() if 'tradeDate' in df.columns else [],
+        'iv30d':       df['iv30d'].tolist()  if 'iv30d'  in df.columns else [],
+        'rvol30':      df['rVol30'].tolist() if 'rVol30' in df.columns else [],
+        'price_dates': price_series.index.strftime('%Y-%m-%d').tolist() if not price_series.empty else [],
+        'prices':      price_series.values.tolist()                      if not price_series.empty else [],
+    }
+    return store, stats
+
+
+@app.callback(
+    Output('vola-chart', 'figure'),
+    [Input('vola-data-store', 'data'), Input('vola-view-tabs', 'value')],
+)
+def render_vola_chart(data, tab_value):
+    empty_fig = go.Figure(layout=layout_settings)
+    if not data or 'error' in data:
+        return empty_fig
+
+    sym        = data.get('sym', '')
+    iv_dates   = pd.to_datetime(data['iv_dates'])
+    iv30d      = np.array(data['iv30d'])
+    rvol30     = np.array(data['rvol30'])
+    price_dates = pd.to_datetime(data['price_dates'])
+    prices      = np.array(data['prices'])
+
+    if tab_value == 'tab-vola-iv':
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
+                            subplot_titles=(f'{sym} Price', 'Implied & Realized Volatility (30d)'),
+                            row_heights=[0.4, 0.6])
+        if len(prices):
+            fig.add_trace(go.Scatter(x=price_dates, y=prices, mode='lines', name='Price',
+                                     line=dict(color='#ffffff', width=1.5),
+                                     hovertemplate='$%{y:.2f}<extra>Price</extra>'), row=1, col=1)
+        if len(iv30d):
+            fig.add_trace(go.Scatter(x=iv_dates, y=iv30d * 100, mode='lines', name='IV 30d',
+                                     line=dict(color=colors['accent'], width=1.5),
+                                     hovertemplate='%{y:.1f}%<extra>IV 30d</extra>'), row=2, col=1)
+        if len(rvol30):
+            fig.add_trace(go.Scatter(x=iv_dates, y=rvol30 * 100, mode='lines', name='HV 30d',
+                                     line=dict(color='#00c8ff', width=1.5, dash='dot'),
+                                     hovertemplate='%{y:.1f}%<extra>HV 30d</extra>'), row=2, col=1)
+        fig.update_yaxes(title_text='Price ($)', tickprefix='$', row=1, col=1)
+        fig.update_yaxes(title_text='Vol (%)', ticksuffix='%', row=2, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor='#222', row=2, col=1)
+
+    else:  # tab-vola-greeks
+        # Align ORATS IV dates with yfinance price dates
+        price_df = pd.Series(prices, index=price_dates).rename('spot')
+        iv_df    = pd.DataFrame({'iv': iv30d}, index=iv_dates)
+        merged   = iv_df.join(price_df, how='inner').dropna()
+
+        if merged.empty:
+            return empty_fig
+
+        vegas, thetas, tv_ratios = [], [], []
+        for spot, iv_dec in zip(merged['spot'], merged['iv']):
+            g = bs_greeks_atm(spot, iv_dec * 100, 30)
+            if g:
+                vegas.append(g['vega'])
+                thetas.append(g['theta'])
+                tv_ratios.append(abs(g['theta'] / g['vega']) if g['vega'] else np.nan)
+            else:
+                vegas.append(np.nan); thetas.append(np.nan); tv_ratios.append(np.nan)
+
+        dates = merged.index
+        tv_arr = np.array(tv_ratios)
+        tv_median = np.nanmedian(tv_arr)
+
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
+                            subplot_titles=(f'{sym} ATM Vega ($/1% IV, per share)',
+                                            'Theta ($/day, per share)',
+                                            'Θ/V Ratio — Carry Efficiency'),
+                            row_heights=[0.33, 0.33, 0.34])
+
+        fig.add_trace(go.Scatter(x=dates, y=vegas, mode='lines', name='Vega',
+                                 line=dict(color=colors['accent'], width=1.5),
+                                 hovertemplate='$%{y:.3f}<extra>Vega</extra>'), row=1, col=1)
+
+        fig.add_trace(go.Scatter(x=dates, y=thetas, mode='lines', name='Theta',
+                                 line=dict(color=colors['put_text'], width=1.5),
+                                 hovertemplate='$%{y:.3f}<extra>Theta</extra>'), row=2, col=1)
+
+        fig.add_trace(go.Scatter(x=dates, y=tv_ratios, mode='lines', name='Θ/V',
+                                 line=dict(color='#00c8ff', width=1.5),
+                                 hovertemplate='%{y:.4f}<extra>Θ/V</extra>'), row=3, col=1)
+
+        # Shade region where Θ/V > median (attractive short vol carry)
+        fig.add_hrect(y0=tv_median, y1=float(np.nanmax(tv_arr)) * 1.05,
+                      fillcolor='rgba(0,200,0,0.07)', line_width=0, row=3, col=1)
+        fig.add_hline(y=tv_median, line_dash='dash', line_color='#555', line_width=1,
+                      annotation_text=f'Median {tv_median:.4f}',
+                      annotation_font_color='#888', row=3, col=1)
+
+        fig.update_yaxes(title_text='Vega ($)', tickprefix='$', row=1, col=1)
+        fig.update_yaxes(title_text='Theta ($)', tickprefix='$', row=2, col=1)
+        fig.update_yaxes(title_text='Θ/V', row=3, col=1)
+        fig.update_xaxes(showgrid=True, gridcolor='#222', row=3, col=1)
+
+    fig.update_layout(**layout_settings,
+                      legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
+                      margin=dict(l=55, r=20, t=60, b=40))
+    return fig
 
 
 if __name__ == '__main__':
