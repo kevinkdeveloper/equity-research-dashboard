@@ -1,4 +1,6 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import requests
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update, dash_table
