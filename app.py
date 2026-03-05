@@ -581,7 +581,7 @@ spread_layout = html.Div([
                         11: {'label': '3M',  'style': {'color': '#888', 'fontSize': '0.75em'}},
                         12: {'label': 'Now', 'style': {'color': '#888', 'fontSize': '0.75em'}},
                     },
-                    tooltip={'always_visible': False, 'placement': 'bottom'},
+                    tooltip=None,
                 )
             ]),
 
@@ -629,7 +629,7 @@ vol_surface_layout = html.Div([
             html.Div(style={'padding': '0 10px 16px 10px'}, children=[
                 dcc.Slider(id='vol-moneyness-slider', min=10, max=40, step=5, value=25,
                            marks={10: '±10%', 20: '±20%', 30: '±30%', 40: '±40%'},
-                           tooltip={"placement": "bottom", "always_visible": False}),
+                           tooltip=None),
             ]),
 
             html.Label("DTE Range", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
@@ -637,7 +637,7 @@ vol_surface_layout = html.Div([
             html.Div(style={'padding': '0 10px 16px 10px'}, children=[
                 dcc.RangeSlider(id='vol-dte-range', min=1, max=365, step=1, value=[7, 180],
                                 marks={7: '7d', 30: '30d', 60: '60d', 90: '90d', 180: '180d', 365: '1y'},
-                                tooltip={"placement": "bottom", "always_visible": False}),
+                                tooltip=None),
             ]),
 
             html.Label("Z-Axis", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
@@ -689,7 +689,7 @@ vol_surface_layout = html.Div([
                                 html.Label("Expiry", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block', 'marginBottom': '2px'}),
                                 html.Div("Fetch surface first, then drag to select an expiration.", className='helper-text', style={'marginBottom': '14px'}),
                                 dcc.Slider(id='vol-smile-expiry', min=0, max=0, step=1, value=0, marks={},
-                                           tooltip={"placement": "bottom", "always_visible": False}),
+                                           tooltip=None),
                             ]),
                             dcc.Graph(id='vol-smile-chart', style={'height': '58vh', 'minHeight': '400px'}),
                         ]),
@@ -780,7 +780,7 @@ vol_analysis_layout = html.Div([
                         10: {'label': '2W',   'style': {'color': '#888', 'fontSize': '0.75em'}},
                         11: {'label': 'Now',  'style': {'color': '#888', 'fontSize': '0.75em'}},
                     },
-                    tooltip={'always_visible': False, 'placement': 'bottom'},
+                    tooltip=None,
                 )
             ]),
 
