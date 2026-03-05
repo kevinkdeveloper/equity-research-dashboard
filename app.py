@@ -69,8 +69,6 @@ def get_initial_price(ticker_symbol):
         pass
     return 400.00
 
-initial_spot = get_initial_price(DEFAULT_TICKER)
-initial_strike = initial_spot
 
 
 
