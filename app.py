@@ -29,8 +29,8 @@ DEFAULT_RATE = 0.04
 DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
 DEFAULT_SCANNER_TICKERS = "SPY, QQQ, GLD, SLV, TLT, USO"
-POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'qvG5Nf6OFdw8Od7oMVeUo7B0q3lB0zbo')
-ORATS_API_KEY   = os.environ.get('ORATS_API_KEY', '5da70713-74bc-4903-bb54-30458e212856')
+POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', '')
+ORATS_API_KEY   = os.environ.get('ORATS_API_KEY', '')
 
 # --- Historical vol-surface date slider: weekly steps for the past ~2 years ---
 
