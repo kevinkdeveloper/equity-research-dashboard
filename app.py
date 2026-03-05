@@ -1,5 +1,5 @@
 import os
-import time
+import requests
 import dash
 from dash import dcc, html, Input, Output, State, ctx, no_update, dash_table
 import plotly.graph_objects as go
@@ -30,6 +30,7 @@ DEFAULT_SPREAD_A = "SPY"
 DEFAULT_SPREAD_B = "GLD"
 DEFAULT_SCANNER_TICKERS = "SPY, QQQ, GLD, SLV, TLT, USO"
 POLYGON_API_KEY = os.environ.get('POLYGON_API_KEY', 'qvG5Nf6OFdw8Od7oMVeUo7B0q3lB0zbo')
+ORATS_API_KEY   = os.environ.get('ORATS_API_KEY', '5da70713-74bc-4903-bb54-30458e212856')
 
 # --- Historical vol-surface date slider: weekly steps for the past ~2 years ---
 
@@ -113,85 +114,63 @@ def generate_vol_signals(current_iv, current_hv, rvr, skew_ratio, term_slope):
 
 
 
-def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key):
-    """Pull a live options chain snapshot from Polygon.io and return (data_dict, error_string)."""
-    if not POLYGON_AVAILABLE:
-        return None, "polygon-api-client not installed. Run: pip install polygon-api-client"
-    if not api_key or not api_key.strip():
-        return None, "No API key. Enter your Polygon.io key in the sidebar."
-
+def fetch_orats_surface(ticker_symbol, contract_type, moneyness_pct):
+    """Pull a live options chain from ORATS /live/strikes and return (data_dict, error_string)."""
+    if not ORATS_API_KEY:
+        return None, "ORATS_API_KEY not set."
     try:
-        client = PolygonClient(api_key=api_key.strip())
+        resp = requests.get(
+            'https://api.orats.io/datav2/live/strikes',
+            params={'token': ORATS_API_KEY, 'ticker': ticker_symbol.upper()},
+            timeout=20
+        )
+        if resp.status_code in (401, 403):
+            return None, "ORATS key unauthorized — check your subscription."
+        resp.raise_for_status()
+
+        rows = resp.json().get('data', [])
+        if not rows:
+            return None, f"No ORATS strike data for {ticker_symbol}"
+
         today = datetime.date.today()
-
-        params = {"limit": 250}
-        if contract_type in ("call", "put"):
-            params["contract_type"] = contract_type
-
-        contracts = list(client.list_snapshot_options_chain(
-            ticker_symbol.upper(), params=params
-        ))
-
-        if not contracts:
-            return None, (
-                f"No options data returned for {ticker_symbol}. "
-                "Check your API key or ensure your plan includes options data."
-            )
-
-        spot = None
-        for c in contracts:
-            if c.underlying_asset and c.underlying_asset.price:
-                spot = c.underlying_asset.price
-                break
-        if not spot:
-            spot = get_initial_price(ticker_symbol) or None
-
-        ref_date = today
+        spot  = rows[0].get('stockPrice') or get_initial_price(ticker_symbol) or None
 
         strikes, dtes, ivs, prices, deltas, volumes, exps, ctypes = [], [], [], [], [], [], [], []
         expirations_seen = set()
 
-        for c in contracts:
-            iv = c.implied_volatility
-            if not iv or iv < 0.005:
+        for row in rows:
+            exp_str = row.get('expirDate')
+            strike  = row.get('strike')
+            if not exp_str or strike is None:
                 continue
-            if not c.details:
+            exp_date = datetime.date.fromisoformat(exp_str)
+            dte = (exp_date - today).days
+            if dte <= 0:
                 continue
-
-            strike = c.details.strike_price
-            exp_str = c.details.expiration_date   # "YYYY-MM-DD"
-
-            # Moneyness filter (skip deep ITM / OTM)
             if spot and not (spot * (1 - moneyness_pct) <= strike <= spot * (1 + moneyness_pct)):
                 continue
 
-            exp_date = datetime.date.fromisoformat(exp_str)
-            dte = (exp_date - ref_date).days
-            if dte <= 0:
-                continue
-
-            # Option price: prefer bid-ask midpoint, fall back to last trade, then day close
-            opt_price = None
-            if c.last_quote and c.last_quote.midpoint:
-                opt_price = c.last_quote.midpoint
-            elif c.last_trade and c.last_trade.price:
-                opt_price = c.last_trade.price
-            elif c.day and c.day.close:
-                opt_price = c.day.close
-
-            strikes.append(strike)
-            dtes.append(dte)
-            ivs.append(iv)           # Polygon returns as decimal (0.25 = 25%)
-            prices.append(opt_price)
-            expirations_seen.add(exp_str)
-            exps.append(exp_str)
-            ctypes.append(c.details.contract_type if c.details.contract_type else 'unknown')
-
-            deltas.append(abs(c.greeks.delta) if c.greeks and c.greeks.delta is not None else None)
-            volumes.append(c.day.volume if c.day and c.day.volume else 0)
+            for ctype, iv_key, price_key, delta_key, vol_key in [
+                ('call', 'callMidIv',  'callMidPrice', 'callDelta', 'callVolume'),
+                ('put',  'putMidIv',   'putMidPrice',  'putDelta',  'putVolume'),
+            ]:
+                if contract_type not in (ctype, 'both'):
+                    continue
+                iv = row.get(iv_key)
+                if not iv or iv < 0.005:
+                    continue
+                strikes.append(strike)
+                dtes.append(dte)
+                ivs.append(iv)
+                prices.append(row.get(price_key))
+                deltas.append(abs(row.get(delta_key) or 0) or None)
+                volumes.append(row.get(vol_key) or 0)
+                exps.append(exp_str)
+                ctypes.append(ctype)
+                expirations_seen.add(exp_str)
 
         if len(strikes) < 5:
-            return None, "Too few liquid contracts returned. Try widening the moneyness range."
+            return None, "Too few liquid contracts. Try widening the moneyness range."
 
         return {
             "strikes": strikes, "dtes": dtes, "ivs": ivs, "prices": prices,
@@ -201,14 +180,13 @@ def fetch_polygon_surface(ticker_symbol, contract_type, moneyness_pct, api_key):
             "exp_count": len(expirations_seen),
         }, None
 
+    except requests.exceptions.Timeout:
+        return None, "ORATS request timed out"
     except Exception as e:
-        msg = str(e)
-        if "403" in msg or "Forbidden" in msg:
-            return None, "API key rejected or plan doesn't include options. Check polygon.io account."
-        return None, f"Polygon error: {msg}"
+        return None, f"ORATS error: {e}"
 
 
-def scan_ticker(ticker_symbol):
+def scan_ticker(ticker_symbol, target_dte=30):
     """Fetch vol metrics for one ticker using Polygon.io and return a table row dict."""
     if not POLYGON_AVAILABLE or not POLYGON_API_KEY:
         return None
@@ -261,7 +239,7 @@ def scan_ticker(ticker_symbol):
                 and (datetime.date.fromisoformat(c.details.expiration_date) - today).days >= 7
             })
             if valid_exps:
-                nearest_exp = valid_exps[0]
+                nearest_exp = min(valid_exps, key=lambda e: abs((datetime.date.fromisoformat(e) - today).days - target_dte))
 
                 # Split into calls/puts for nearest expiry with valid IV
                 near = [c for c in contracts
@@ -333,6 +311,103 @@ def scan_ticker(ticker_symbol):
         }
     except Exception as e:
         return {'Ticker': ticker_symbol, '_error': str(e)}
+
+
+def scan_ticker_orats(ticker_symbol, target_dte=30):
+    """Fetch vol metrics for one ticker using ORATS summaries API."""
+    if not ORATS_API_KEY:
+        return {'Ticker': ticker_symbol, '_error': 'ORATS_API_KEY not set. Add it in Render → Environment.'}
+    try:
+        resp = requests.get(
+            'https://api.orats.io/datav2/live/summaries',
+            params={'token': ORATS_API_KEY, 'ticker': ticker_symbol.upper()},
+            timeout=10
+        )
+        if resp.status_code in (401, 403):
+            return {'Ticker': ticker_symbol, '_error': 'ORATS key unauthorized — check your subscription.'}
+        resp.raise_for_status()
+
+        data = resp.json().get('data', [])
+        if not data:
+            return {'Ticker': ticker_symbol, '_error': f'No ORATS data for {ticker_symbol}'}
+
+        d = data[0]
+        spot   = d.get('stockPrice')
+        atm_iv = d.get('iv30d')   # 30-day ATM implied vol (decimal)
+        hv20   = d.get('rVol30')  # 30-day realized vol (decimal)
+
+        if not spot or not atm_iv or not hv20:
+            missing = [k for k, v in [('stockPrice', spot), ('iv30d', atm_iv), ('rVol30', hv20)] if not v]
+            return {'Ticker': ticker_symbol, '_error': f'Missing fields: {missing}'}
+
+        current_iv = atm_iv * 100
+        current_hv = hv20   * 100
+        vrp_ratio  = current_iv / current_hv if current_hv else None
+
+        # Skew: 25-delta put IV / 75-delta call IV (both already in summaries)
+        put_iv_d25  = d.get('dlt25Iv30d')
+        call_iv_d75 = d.get('dlt75Iv30d')
+        skew_ratio  = (put_iv_d25 / call_iv_d75) if (put_iv_d25 and call_iv_d75 and call_iv_d75 > 0) else None
+
+        verdict = ('Expensive' if vrp_ratio and vrp_ratio > 1.25
+                   else 'Cheap' if vrp_ratio and vrp_ratio < 0.80
+                   else 'Neutral' if vrp_ratio else 'N/A')
+
+        # Supplement with yfinance: P/C vol from options chain + HV rank from price history
+        pc_vol_ratio = None
+        hv_rank_val  = None
+        try:
+            import yfinance as yf
+            tkr  = yf.Ticker(ticker_symbol)
+            exps = tkr.options
+            if exps:
+                chain     = tkr.option_chain(exps[0])
+                c_vol     = chain.calls['volume'].sum()
+                p_vol     = chain.puts['volume'].sum()
+                pc_vol_ratio = p_vol / c_vol if c_vol > 0 else None
+            hist = tkr.history(period='1y')
+            if len(hist) > 25:
+                log_ret    = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+                roll_hv    = log_ret.rolling(20).std() * np.sqrt(252) * 100
+                roll_hv    = roll_hv.dropna()
+                cur_hv     = roll_hv.iloc[-1]
+                hv_rank_val = (roll_hv < cur_hv).mean() * 100
+        except Exception:
+            pass
+
+        skew_bearish = skew_ratio is not None and skew_ratio > 1.15
+        skew_bullish = skew_ratio is not None and skew_ratio < 0.88
+        pc_bearish   = pc_vol_ratio is not None and pc_vol_ratio > 1.10
+        pc_bullish   = pc_vol_ratio is not None and pc_vol_ratio < 0.75
+        bear_votes   = int(skew_bearish) + int(pc_bearish)
+        bull_votes   = int(skew_bullish) + int(pc_bullish)
+        bias         = "Bearish" if bear_votes > bull_votes else "Bullish" if bull_votes > bear_votes else "Neutral"
+
+        iv_cheap     = vrp_ratio is not None and vrp_ratio < 0.85
+        iv_expensive = vrp_ratio is not None and vrp_ratio > 1.25
+        call_rec = ("Buy"  if bias == "Bullish" and iv_cheap
+                    else "Sell" if bias == "Bearish" and iv_expensive else "Hold")
+        put_rec  = ("Buy"  if bias == "Bearish" and iv_cheap
+                    else "Sell" if bias == "Bullish" and iv_expensive else "Hold")
+
+        return {
+            'Ticker':   ticker_symbol,
+            'Price':    f"${spot:.2f}",
+            'IV %':     f"{current_iv:.1f}",
+            'HV %':     f"{current_hv:.1f}",
+            'IV/HV':    f"{vrp_ratio:.2f}x" if vrp_ratio else 'N/A',
+            'Skew':     f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
+            'P/C Vol':  f"{pc_vol_ratio:.2f}" if pc_vol_ratio is not None else 'N/A',
+            'HV Rank':  f"{hv_rank_val:.0f}%" if hv_rank_val is not None else 'N/A',
+            'Bias':     bias,
+            'Call Rec': call_rec,
+            'Put Rec':  put_rec,
+            'Verdict':  verdict,
+        }
+    except requests.exceptions.Timeout:
+        return {'Ticker': ticker_symbol, '_error': 'ORATS request timed out'}
+    except Exception as e:
+        return {'Ticker': ticker_symbol, '_error': f'ORATS error: {e}'}
 
 
 # -----------------------------------------------------------------------------
@@ -503,7 +578,7 @@ vol_surface_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
             html.H3("Vol Surface", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Live implied volatility surface powered by Polygon.io.", className='helper-text', style={'marginTop': '0'}),
+            html.P("Live implied volatility surface powered by ORATS.", className='helper-text', style={'marginTop': '0'}),
 
             html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
             dcc.Input(id='vol-ticker-input', type='text', value='SLV', placeholder="e.g. SPY, AAPL, TSLA",
@@ -528,6 +603,14 @@ vol_surface_layout = html.Div([
                 dcc.Slider(id='vol-moneyness-slider', min=10, max=40, step=5, value=25,
                            marks={10: '±10%', 20: '±20%', 30: '±30%', 40: '±40%'},
                            tooltip={"placement": "bottom", "always_visible": False}),
+            ]),
+
+            html.Label("DTE Range", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            html.Div("Filter expirations shown on the surface", className='helper-text'),
+            html.Div(style={'padding': '0 10px 16px 10px'}, children=[
+                dcc.RangeSlider(id='vol-dte-range', min=1, max=365, step=1, value=[7, 180],
+                                marks={7: '7d', 30: '30d', 60: '60d', 90: '90d', 180: '180d', 365: '1y'},
+                                tooltip={"placement": "bottom", "always_visible": False}),
             ]),
 
             html.Label("Z-Axis", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
@@ -555,7 +638,7 @@ vol_surface_layout = html.Div([
             ),
 
             html.Div(style={'display': 'flex', 'flexDirection': 'column', 'gap': '6px', 'marginTop': '6px'}, children=[
-                html.Button('Fetch  (Polygon)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
+                html.Button('Fetch (ORATS)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
             ]),
             html.Hr(className='section-divider'),
             html.Div(id='vol-info-display', children=html.Div([
@@ -601,7 +684,7 @@ scanner_layout = html.Div([
 
             html.Hr(className='section-divider'),
 
-            html.Button('Scan (Polygon)', id='scanner-polygon-btn', n_clicks=0,
+            html.Button('Scan (ORATS)', id='scanner-polygon-btn', n_clicks=0,
                         style={**BUTTON_STYLE, 'marginTop': '10px'}),
             html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.8em', 'fontStyle': 'italic', 'marginTop': '4px'}),
 
@@ -827,13 +910,20 @@ def update_spread_analysis(n_clicks, tickers_raw, slider_val):
 
 # Results are cached per (ticker, date, contract_type, moneyness) so re-visiting
 # a previously fetched date is instant with zero additional API calls.
-def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness_pct):
+def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness_pct, dte_range=None):
     """Render a surface/scatter figure from a cached data dict. Returns (fig, info_html, smile_marks, smile_max)."""
-    strikes    = data['strikes']
-    dtes       = data['dtes']
-    ivs        = data['ivs']
-    raw_prices = data['prices']
+    dte_min = dte_range[0] if dte_range else 1
+    dte_max = dte_range[1] if dte_range else 9999
+
+    mask       = [dte_min <= d <= dte_max for d in data['dtes']]
+    strikes    = [v for v, m in zip(data['strikes'],    mask) if m]
+    dtes       = [v for v, m in zip(data['dtes'],       mask) if m]
+    ivs        = [v for v, m in zip(data['ivs'],        mask) if m]
+    raw_prices = [v for v, m in zip(data['prices'],     mask) if m]
     spot       = data['spot']
+
+    if len(strikes) < 5:
+        return None, "not_enough_price", None, None
 
     min_strike, max_strike = min(strikes), max(strikes)
     min_dte,    max_dte    = min(dtes),    max(dtes)
@@ -938,8 +1028,8 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
     iv_pcts    = [v * 100 for v in ivs]
     price_vals = [p for p in raw_prices if p is not None]
     info_html = html.Div([
-        html.H4("Surface Data · Polygon.io", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-        make_stat_row("Source",       "Polygon.io — Live"),
+        html.H4("Surface Data · ORATS", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
+        make_stat_row("Source",       "ORATS — Live"),
         make_stat_row("Date",         today_str),
         make_stat_row("Spot Price",   f"${spot:.2f}" if spot else "N/A", colors['accent']),
         make_stat_row("Contracts",    f"{data['contract_count']:,}"),
@@ -969,37 +1059,38 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
      Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value')],
     [Input('vol-submit-btn', 'n_clicks'),
      Input('vol-plot-type', 'value'),
-     Input('vol-z-axis', 'value')],
+     Input('vol-z-axis', 'value'),
+     Input('vol-dte-range', 'value')],
     [State('vol-ticker-input', 'value'),
      State('vol-contract-type', 'value'),
      State('vol-moneyness-slider', 'value'),
      State('vol-data-store', 'data')],
     prevent_initial_call=True
 )
-def update_vol_surface(_n_poly, plot_type, z_axis, ticker_symbol, contract_type, moneyness_slider, stored_data):
+def update_vol_surface(_n_poly, plot_type, z_axis, dte_range, ticker_symbol, contract_type, moneyness_slider, stored_data):
     empty_fig = go.Figure(layout=layout_settings)
     triggered  = ctx.triggered_id
 
     # --- Re-render from cache (no fetch) when only display toggles changed ---
-    if triggered in ('vol-plot-type', 'vol-z-axis'):
+    if triggered in ('vol-plot-type', 'vol-z-axis', 'vol-dte-range'):
         if not stored_data:
             return no_update, no_update, no_update, no_update, no_update, no_update
         sym           = (ticker_symbol or '').upper().strip()
         moneyness_pct = (moneyness_slider or 25) / 100
-        fig, _, _, _ = _build_surface_figure(stored_data, sym, contract_type, z_axis, plot_type, moneyness_pct)
+        fig, _, _, _ = _build_surface_figure(stored_data, sym, contract_type, z_axis, plot_type, moneyness_pct, dte_range)
         if fig is None:
             return no_update, no_update, no_update, no_update, no_update, no_update
         return fig, no_update, no_update, no_update, no_update, no_update
 
     # --- Fetch fresh data ---
     if not ticker_symbol:
-        return empty_fig, html.Div(), no_update, no_update, no_update, no_update, time.time()
+        return empty_fig, html.Div(), no_update, no_update, no_update, no_update
 
     sym           = ticker_symbol.upper().strip()
     moneyness_pct = (moneyness_slider or 25) / 100
 
-    data, err    = fetch_polygon_surface(sym, contract_type, moneyness_pct, POLYGON_API_KEY)
-    source_label = "Polygon"
+    data, err    = fetch_orats_surface(sym, contract_type, moneyness_pct)
+    source_label = "ORATS"
 
     if err:
         info = html.Div([
@@ -1009,7 +1100,7 @@ def update_vol_surface(_n_poly, plot_type, z_axis, ticker_symbol, contract_type,
         return empty_fig, info, no_update, no_update, no_update, no_update
 
     fig, info_html, smile_marks, smile_max = _build_surface_figure(
-        data, sym, contract_type, z_axis, plot_type, moneyness_pct)
+        data, sym, contract_type, z_axis, plot_type, moneyness_pct, dte_range)
     if fig is None:
         return empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
                                    style={'color': colors['danger']}), \
@@ -1222,8 +1313,8 @@ def run_scanner(_n, tickers_raw):
         return html.Div("Enter tickers and click Scan.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), ""
 
     tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
-    results = [scan_ticker(t) for t in tickers]
-    source_label = 'Polygon'
+    results = [scan_ticker_orats(t) for t in tickers]
+    source_label = 'ORATS'
 
     errors = [r for r in results if r and '_error' in r]
     rows   = [r for r in results if r and '_error' not in r]
