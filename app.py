@@ -410,6 +410,33 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         return {'Ticker': ticker_symbol, '_error': f'ORATS error: {e}'}
 
 
+def fetch_orats_hist_iv(ticker_symbol):
+    """Fetch full historical daily IV/HV from ORATS /hist/summaries. Returns (DataFrame, error_string)."""
+    if not ORATS_API_KEY:
+        return None, "ORATS_API_KEY not set."
+    try:
+        params = {'token': ORATS_API_KEY, 'ticker': ticker_symbol.upper()}
+        resp = requests.get(
+            'https://api.orats.io/datav2/hist/summaries',
+            params=params,
+            timeout=20
+        )
+        if resp.status_code in (401, 403):
+            return None, "ORATS key unauthorized."
+        resp.raise_for_status()
+        rows = resp.json().get('data', [])
+        if not rows:
+            return None, f"No ORATS historical data for {ticker_symbol}"
+        df = pd.DataFrame(rows)
+        df['tradeDate'] = pd.to_datetime(df['tradeDate'])
+        df = df.sort_values('tradeDate').reset_index(drop=True)
+        return df, None
+    except requests.exceptions.Timeout:
+        return None, "ORATS request timed out"
+    except Exception as e:
+        return None, f"ORATS error: {e}"
+
+
 # -----------------------------------------------------------------------------
 # 3. APP LAYOUT & STYLES (Mobile Optimized)
 # -----------------------------------------------------------------------------
@@ -721,6 +748,55 @@ cal_layout = html.Div([
     ])
 ])
 
+# --- 4b. VOL ANALYSIS TAB LAYOUT ---
+vol_analysis_layout = html.Div([
+    html.Div(style=FLEX_WRAPPER_STYLE, children=[
+        html.Div(style=SIDEBAR_STYLE, children=[
+            html.H3("Vol Analysis", style={'color': colors['accent'], 'marginBottom': '4px'}),
+            html.P("Historical implied & realized volatility powered by ORATS.", className='helper-text', style={'marginTop': '0'}),
+
+            html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            dcc.Input(id='vola-ticker-input', type='text', value='SPY', placeholder='e.g. SPY, AAPL',
+                      style={**INPUT_STYLE, 'marginBottom': '12px'}),
+
+            html.Label("Date Range", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '4px', 'marginBottom': '4px'}),
+            html.Div("Drag both handles to set start and end.", className='helper-text'),
+            html.Div(style={'padding': '0 10px 28px 10px'}, children=[
+                dcc.RangeSlider(
+                    id='vola-period-slider',
+                    min=0, max=11, step=1,
+                    value=[6, 11],
+                    marks={
+                        0:  {'label': 'MAX', 'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        1:  {'label': '10Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        2:  {'label': '7Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        3:  {'label': '5Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        4:  {'label': '3Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        5:  {'label': '2Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        6:  {'label': '1Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        7:  {'label': '6M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        8:  {'label': '3M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        9:  {'label': '1M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        10: {'label': '2W',   'style': {'color': '#888', 'fontSize': '0.75em'}},
+                        11: {'label': 'Now',  'style': {'color': '#888', 'fontSize': '0.75em'}},
+                    },
+                    tooltip={'always_visible': False, 'placement': 'bottom'},
+                )
+            ]),
+
+            html.Button('Analyze', id='vola-analyze-btn', n_clicks=0, style=BUTTON_STYLE),
+            html.Hr(className='section-divider'),
+            html.Div(id='vola-stats-display', children=html.Div([
+                html.P("Stats will appear here after analysis.", style={'color': colors['muted'], 'fontStyle': 'italic'})
+            ]))
+        ]),
+
+        html.Div(style=CONTENT_STYLE, children=[
+            dcc.Loading(dcc.Graph(id='vola-chart', style={'height': '75vh', 'minHeight': '500px'}), type='circle'),
+        ])
+    ])
+])
+
 # --- APP LAYOUT ---
 # CHANGE: Revamped header with subtitle, added footer
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 20px 0 20px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
@@ -752,12 +828,16 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Vol Surface', value='tab-vol',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
+                dcc.Tab(label='Vol Analysis', value='tab-vola',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
+                        selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
     html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
     html.Div(id='cal-content-wrapper', children=cal_layout, style={'display': 'none'}),
     html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
     html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'block'}),
+    html.Div(id='vola-content-wrapper', children=vol_analysis_layout, style={'display': 'none'}),
 
     # CHANGE: Added footer with context so the app feels polished
     html.Div(style={
@@ -778,16 +858,18 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 # Tab Visibility Toggle
 @app.callback(
     [Output('spread-content-wrapper', 'style'), Output('cal-content-wrapper', 'style'),
-     Output('vol-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style')],
+     Output('vol-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style'),
+     Output('vola-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    spread_style, cal_style, vol_style, scanner_style = [{'display': 'none'}] * 4
-    if tab_value == 'tab-spread': spread_style = {'display': 'block'}
-    elif tab_value == 'tab-cal': cal_style = {'display': 'block'}
-    elif tab_value == 'tab-vol': vol_style = {'display': 'block'}
+    spread_style, cal_style, vol_style, scanner_style, vola_style = [{'display': 'none'}] * 5
+    if tab_value == 'tab-spread':   spread_style  = {'display': 'block'}
+    elif tab_value == 'tab-cal':    cal_style     = {'display': 'block'}
+    elif tab_value == 'tab-vol':    vol_style     = {'display': 'block'}
     elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
-    return spread_style, cal_style, vol_style, scanner_style
+    elif tab_value == 'tab-vola':   vola_style    = {'display': 'block'}
+    return spread_style, cal_style, vol_style, scanner_style, vola_style
 
 # --- SPREAD ANALYSIS CALLBACK ---
 @app.callback(
@@ -1405,6 +1487,121 @@ def run_scanner(_n, tickers_raw):
     status   = f"Scanned {len(rows)}/{len(tickers)} via {source_label} · {ts} ET"
     return table, status
 
+
+
+# --- VOL ANALYSIS CALLBACK ---
+@app.callback(
+    [Output('vola-chart', 'figure'), Output('vola-stats-display', 'children')],
+    [Input('vola-analyze-btn', 'n_clicks')],
+    [State('vola-ticker-input', 'value'), State('vola-period-slider', 'value')],
+    prevent_initial_call=True
+)
+def update_vol_analysis(_n, ticker_symbol, slider_val):
+    empty_fig = go.Figure(layout=layout_settings)
+    if not ticker_symbol:
+        return empty_fig, html.Div()
+
+    sym   = ticker_symbol.strip().upper()
+    today = datetime.date.today()
+
+    _vola_date_map = {
+        0:  None,
+        1:  today - datetime.timedelta(days=365 * 10),
+        2:  today - datetime.timedelta(days=365 * 7),
+        3:  today - datetime.timedelta(days=365 * 5),
+        4:  today - datetime.timedelta(days=365 * 3),
+        5:  today - datetime.timedelta(days=365 * 2),
+        6:  today - datetime.timedelta(days=365),
+        7:  today - datetime.timedelta(days=182),
+        8:  today - datetime.timedelta(days=91),
+        9:  today - datetime.timedelta(days=30),
+        10: today - datetime.timedelta(days=14),
+        11: today,
+    }
+
+    start_idx, end_idx = (slider_val if isinstance(slider_val, list) else [6, 11])
+    start_date = _vola_date_map.get(start_idx)
+    end_date   = _vola_date_map.get(end_idx, today)
+
+    # Fetch ORATS historical IV and filter by date range in Python
+    df, err = fetch_orats_hist_iv(sym)
+    if err:
+        return empty_fig, html.Div(err, style={'color': colors['danger'], 'padding': '10px'})
+    if start_date:
+        df = df[df['tradeDate'] >= pd.Timestamp(start_date)]
+    if end_date and end_date != today:
+        df = df[df['tradeDate'] <= pd.Timestamp(end_date)]
+    df = df.reset_index(drop=True)
+
+    # Fetch stock price history from yfinance
+    hist_kwargs = ({'start': start_date.isoformat(), 'end': (end_date + datetime.timedelta(days=1)).isoformat()}
+                   if start_date else {'period': 'max'})
+    price_series = yf.Ticker(sym).history(**hist_kwargs)['Close']
+
+    # Build 2-row subplot: price on top, IV + HV below
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.06,
+        subplot_titles=(f'{sym} Price', 'Implied & Realized Volatility (30d)'),
+        row_heights=[0.4, 0.6],
+    )
+
+    # Row 1: stock price
+    if not price_series.empty:
+        fig.add_trace(go.Scatter(
+            x=price_series.index, y=price_series.values,
+            mode='lines', name='Price',
+            line=dict(color='#ffffff', width=1.5),
+            hovertemplate='$%{y:.2f}<extra>Price</extra>',
+        ), row=1, col=1)
+
+    # Row 2: IV30d and RVol30
+    if 'iv30d' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['tradeDate'], y=df['iv30d'] * 100,
+            mode='lines', name='IV 30d',
+            line=dict(color=colors['accent'], width=1.5),
+            hovertemplate='%{y:.1f}%<extra>IV 30d</extra>',
+        ), row=2, col=1)
+
+    if 'rVol30' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['tradeDate'], y=df['rVol30'] * 100,
+            mode='lines', name='HV 30d',
+            line=dict(color='#00c8ff', width=1.5, dash='dot'),
+            hovertemplate='%{y:.1f}%<extra>HV 30d</extra>',
+        ), row=2, col=1)
+
+    fig.update_layout(
+        **layout_settings,
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
+        margin=dict(l=50, r=20, t=60, b=40),
+    )
+    fig.update_yaxes(title_text='Price ($)', tickprefix='$', row=1, col=1)
+    fig.update_yaxes(title_text='Vol (%)', ticksuffix='%', row=2, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor='#222', row=2, col=1)
+
+    # Stats panel
+    iv_latest  = df['iv30d'].iloc[-1]  * 100 if 'iv30d'  in df.columns and len(df) else None
+    hv_latest  = df['rVol30'].iloc[-1] * 100 if 'rVol30' in df.columns and len(df) else None
+    iv_max     = df['iv30d'].max()     * 100 if 'iv30d'  in df.columns else None
+    iv_min     = df['iv30d'].min()     * 100 if 'iv30d'  in df.columns else None
+    iv_rank    = ((iv_latest - iv_min) / (iv_max - iv_min) * 100
+                  if iv_latest and iv_max and iv_min and iv_max != iv_min else None)
+    vrp        = (iv_latest / hv_latest if iv_latest and hv_latest else None)
+
+    stats = html.Div([
+        html.H4(f"{sym} Vol Summary", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
+        make_stat_row("IV 30d (latest)",  f"{iv_latest:.1f}%"        if iv_latest  else "N/A"),
+        make_stat_row("HV 30d (latest)",  f"{hv_latest:.1f}%"        if hv_latest  else "N/A"),
+        make_stat_row("IV/HV (VRP)",      f"{vrp:.2f}x"              if vrp        else "N/A"),
+        make_stat_row("IV Rank (period)", f"{iv_rank:.0f}%"          if iv_rank    else "N/A"),
+        make_stat_row("IV Range",         f"{iv_min:.1f}–{iv_max:.1f}%" if iv_min and iv_max else "N/A"),
+        make_stat_row("Data points",      str(len(df))),
+    ])
+
+    return fig, stats
 
 
 if __name__ == '__main__':
