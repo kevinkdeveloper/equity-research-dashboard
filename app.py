@@ -380,9 +380,8 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         # ATM 30d Greeks (per share)
         greeks = bs_greeks_atm(spot, current_iv, 30)
 
-        # Supplement with yfinance: P/C vol + OI from options chain, HV rank from price history
+        # Supplement with yfinance: P/C vol from options chain, HV rank from price history
         pc_vol_ratio = None
-        pc_oi_ratio  = None
         hv_rank_val  = None
         try:
             tkr  = yf.Ticker(ticker_symbol)
@@ -392,9 +391,7 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
                 c_vol = chain.calls['volume'].sum()
                 p_vol = chain.puts['volume'].sum()
                 pc_vol_ratio = p_vol / c_vol if c_vol > 0 else None
-                c_oi = chain.calls['openInterest'].sum()
-                p_oi = chain.puts['openInterest'].sum()
-                pc_oi_ratio = p_oi / c_oi if c_oi > 0 else None
+
             hist = tkr.history(period='1y')
             if len(hist) > 25:
                 log_ret     = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
@@ -412,8 +409,8 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         bull_votes   = int(skew_bullish) + int(pc_bullish)
         bias         = "Bearish" if bear_votes > bull_votes else "Bullish" if bull_votes > bear_votes else "Neutral"
 
-        iv_cheap     = vrp_ratio is not None and vrp_ratio < 0.85
-        iv_expensive = vrp_ratio is not None and vrp_ratio > 1.25
+        iv_cheap     = vrp_ratio is not None and vrp_ratio < 0.95
+        iv_expensive = vrp_ratio is not None and vrp_ratio > 1.10
         call_rec = ("Buy"  if bias == "Bullish" and iv_cheap
                     else "Sell" if bias == "Bearish" and iv_expensive else "Hold")
         put_rec  = ("Buy"  if bias == "Bearish" and iv_cheap
@@ -430,7 +427,9 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
             else:
                 short_vol = 'Neutral'
         elif vrp_ratio:
-            short_vol = 'Sell' if vrp_ratio > 1.25 else ('Buy Vol' if vrp_ratio < 0.85 else 'Neutral')
+            short_vol = ('Sell' if vrp_ratio > 1.25
+                         else 'Buy Vol' if vrp_ratio < 0.85
+                         else 'Neutral')
         else:
             short_vol = 'N/A'
 
@@ -449,7 +448,6 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
             # Positioning tab
             'Skew':        f"{skew_ratio:.2f}x" if skew_ratio else 'N/A',
             'P/C Vol':     f"{pc_vol_ratio:.2f}" if pc_vol_ratio is not None else 'N/A',
-            'P/C OI':      f"{pc_oi_ratio:.2f}"  if pc_oi_ratio  is not None else 'N/A',
             'Bias':        bias,
             # Greeks tab (ATM 30d, per share)
             'Delta':       f"{greeks['delta']:.3f}"  if greeks else 'N/A',
@@ -504,7 +502,7 @@ app = dash.Dash(__name__, suppress_callback_exceptions=True, title='Equity Resea
 server = app.server
 
 SIDEBAR_STYLE = {
-    'flex': '1 1 350px',
+    'flex': '1 1 250px',
     'backgroundColor': colors['card_bg'], 'padding': '20px',
     'borderRadius': '10px', 'boxSizing': 'border-box',
     'display': 'flex', 'flexDirection': 'column',
@@ -760,35 +758,23 @@ vol_surface_layout = html.Div([
 scanner_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
-            html.H3("Stock Scanner", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Scan multiple tickers to find cheap or expensive options based on IV vs realized vol.", className='helper-text', style={'marginTop': '0'}),
-            html.Label("Tickers to Scan", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            html.Div("Comma-separated. Edit or add your own.", className='helper-text'),
+            html.H3("Stock Scanner", style={'color': colors['accent'], 'marginBottom': '8px'}),
             dcc.Textarea(id='scanner-tickers-input', value=DEFAULT_SCANNER_TICKERS,
+                         placeholder="Comma-separated tickers…",
                          style={**INPUT_STYLE, 'height': '80px', 'resize': 'vertical', 'fontFamily': 'monospace'}),
-
-            html.Hr(className='section-divider'),
-
             html.Button('Scan (ORATS)', id='scanner-polygon-btn', n_clicks=0,
-                        style={**BUTTON_STYLE, 'marginTop': '10px'}),
+                        style={**BUTTON_STYLE, 'marginTop': '8px'}),
             html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.8em', 'fontStyle': 'italic', 'marginTop': '4px'}),
-
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Store(id='scanner-data-store'),
-            dcc.Tabs(id='scanner-view-tabs', value='tab-scan-vol',
+            dcc.Tabs(id='scanner-view-tabs', value='tab-scan-overview',
                      style={'marginBottom': '10px'},
                      children=[
-                dcc.Tab(label='Vol / VRP', value='tab-scan-vol',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
-                dcc.Tab(label='Positioning', value='tab-scan-pos',
+                dcc.Tab(label='Overview', value='tab-scan-overview',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666'},
                         selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
                 dcc.Tab(label='Greeks', value='tab-scan-greeks',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
-                dcc.Tab(label='Signals', value='tab-scan-signals',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666'},
                         selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
             ]),
@@ -1517,11 +1503,16 @@ def render_scanner_table(data, tab_value):
         tooltip_delay=0,
         tooltip_duration=None,
     )
+    no_highlight = [
+        {'if': {'state': 'active'},   'backgroundColor': colors['card_bg'], 'border': f"1px solid {colors['card_border']}"},
+        {'if': {'state': 'selected'}, 'backgroundColor': colors['card_bg'], 'border': f"1px solid {colors['card_border']}"},
+    ]
     ticker_style = {'if': {'column_id': 'Ticker'}, 'fontWeight': 'bold', 'color': colors['accent']}
     cell_styles  = []
 
-    if tab_value == 'tab-scan-vol':
-        col_order = ['Ticker', 'Price', 'IV %', 'HV %', 'IV/HV', 'HV Rank', 'Term Struct', 'Exp Move']
+    if tab_value == 'tab-scan-overview':
+        col_order = ['Ticker', 'Price', 'HV Rank', 'Skew', 'P/C Vol', 'Bias', 'Call Rec', 'Put Rec']
+        bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
         for i, row in enumerate(rows):
             ivhv_str = row.get('IV/HV', 'N/A')
             if ivhv_str != 'N/A':
@@ -1539,28 +1530,6 @@ def render_scanner_table(data, tab_value):
                     cell_styles.append({'if': {'row_index': i, 'column_id': 'HV Rank'},
                                         'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
                 except Exception: pass
-            ts_str = row.get('Term Struct', 'N/A')
-            if ts_str != 'N/A':
-                try:
-                    val = float(ts_str.replace('x', ''))
-                    t = max(0.0, min(1.0, (val - 0.85) / 0.30))
-                    cell_styles.append({'if': {'row_index': i, 'column_id': 'Term Struct'},
-                                        'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
-                except Exception: pass
-        return dash_table.DataTable(
-            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
-            style_data_conditional=[ticker_style, *cell_styles],
-            tooltip_header={
-                'IV/HV':       'IV ÷ HV (VRP). >1.25 = expensive vol, <0.80 = cheap vol',
-                'HV Rank':     'Percentile of current HV vs 1-year history. >70 = elevated realized vol',
-                'Term Struct': '60d IV ÷ 30d IV. >1 = contango (normal), <1 = backwardation (stress)',
-                'Exp Move':    '30-day 1σ expected move = IV × √(30/365)',
-            }, **base_style)
-
-    elif tab_value == 'tab-scan-pos':
-        col_order = ['Ticker', 'Price', 'Skew', 'P/C Vol', 'P/C OI', 'Bias']
-        bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
-        for i, row in enumerate(rows):
             skew_str = row.get('Skew', 'N/A')
             if skew_str != 'N/A':
                 try:
@@ -1569,7 +1538,7 @@ def render_scanner_table(data, tab_value):
                     cell_styles.append({'if': {'row_index': i, 'column_id': 'Skew'},
                                         'backgroundColor': pc.sample_colorscale('RdYlGn', [t])[0], 'color': '#111'})
                 except Exception: pass
-            for col_id in ('P/C Vol', 'P/C OI'):
+            for col_id in ('P/C Vol',):
                 pc_str = row.get(col_id, 'N/A')
                 if pc_str != 'N/A':
                     try:
@@ -1584,12 +1553,23 @@ def render_scanner_table(data, tab_value):
                                 'color': '#111', 'fontWeight': 'bold'})
         return dash_table.DataTable(
             data=rows, columns=[{'name': c, 'id': c} for c in col_order],
-            style_data_conditional=[ticker_style, *cell_styles],
+            style_data_conditional=[
+                ticker_style, *cell_styles, *no_highlight,
+                {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Call Rec} = "Hold"', 'column_id': 'Call Rec'}, 'color': colors['muted']},
+                {'if': {'filter_query': '{Put Rec} = "Buy"',   'column_id': 'Put Rec'},  'color': colors['call_text'], 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Put Rec} = "Sell"',  'column_id': 'Put Rec'},  'color': colors['put_text'],  'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'},  'color': colors['muted']},
+            ],
             tooltip_header={
-                'Skew':    '25Δ put IV ÷ 75Δ call IV. >1.15 = bearish fear, <0.88 = bullish complacency',
-                'P/C Vol': 'Put volume ÷ call volume (near-term). >1.10 = bearish flow',
-                'P/C OI':  'Put OI ÷ call OI (near-term). Persistent positioning vs intraday flow',
-                'Bias':    'Directional vote from Skew + P/C Vol',
+                'HV Rank':  'Percentile of current HV vs 1-year history. >70 = elevated realized vol',
+                'Skew':     '25Δ put IV ÷ 75Δ call IV. >1.15 = bearish fear, <0.88 = bullish complacency',
+                'P/C Vol':  'Put volume ÷ call volume (near-term). >1.10 = bearish flow',
+
+                'Bias':     'Directional vote from Skew + P/C Vol',
+                'Call Rec': 'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
+                'Put Rec':  'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
             }, **base_style)
 
     elif tab_value == 'tab-scan-greeks':
@@ -1606,7 +1586,7 @@ def render_scanner_table(data, tab_value):
                 except Exception: pass
         return dash_table.DataTable(
             data=rows, columns=[{'name': c, 'id': c} for c in col_order],
-            style_data_conditional=[ticker_style, *cell_styles],
+            style_data_conditional=[ticker_style, *cell_styles, *no_highlight],
             tooltip_header={
                 'Delta': 'ATM call delta (≈0.50). Directional exposure per share.',
                 'Gamma': 'Rate of delta change per $1 stock move. Per share.',
@@ -1615,34 +1595,6 @@ def render_scanner_table(data, tab_value):
                 'Θ/V':   '|Theta| ÷ Vega. Higher = more premium collected per unit of vol risk. Key for short vega sizing.',
             }, **base_style)
 
-    else:  # tab-scan-signals
-        col_order = ['Ticker', 'Bias', 'Short Vol', 'Call Rec', 'Put Rec']
-        bias_t = {'Bullish': 1.0, 'Neutral': 0.5, 'Bearish': 0.0}
-        for i, row in enumerate(rows):
-            t_bias = bias_t.get(row.get('Bias', 'Neutral'), 0.5)
-            cell_styles.append({'if': {'row_index': i, 'column_id': 'Bias'},
-                                'backgroundColor': pc.sample_colorscale('RdYlGn', [t_bias])[0],
-                                'color': '#111', 'fontWeight': 'bold'})
-        return dash_table.DataTable(
-            data=rows, columns=[{'name': c, 'id': c} for c in col_order],
-            style_data_conditional=[
-                ticker_style, *cell_styles,
-                {'if': {'filter_query': '{Short Vol} = "Strong Sell"', 'column_id': 'Short Vol'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Short Vol} = "Sell"',        'column_id': 'Short Vol'}, 'color': '#ff9944',           'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Short Vol} = "Buy Vol"',     'column_id': 'Short Vol'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Short Vol} = "Neutral"',     'column_id': 'Short Vol'}, 'color': colors['muted']},
-                {'if': {'filter_query': '{Call Rec} = "Buy"',  'column_id': 'Call Rec'}, 'color': colors['call_text'], 'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Call Rec} = "Sell"', 'column_id': 'Call Rec'}, 'color': colors['put_text'],  'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Call Rec} = "Hold"', 'column_id': 'Call Rec'}, 'color': colors['muted']},
-                {'if': {'filter_query': '{Put Rec} = "Buy"',   'column_id': 'Put Rec'},  'color': colors['call_text'], 'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Put Rec} = "Sell"',  'column_id': 'Put Rec'},  'color': colors['put_text'],  'fontWeight': 'bold'},
-                {'if': {'filter_query': '{Put Rec} = "Hold"',  'column_id': 'Put Rec'},  'color': colors['muted']},
-            ],
-            tooltip_header={
-                'Short Vol': 'Short vega signal. Strong Sell: IV/HV>1.25 & HV Rank>60. Sell: IV/HV>1.15 & HV Rank>40.',
-                'Call Rec':  'Buy = bullish bias + cheap IV. Sell = bearish bias + expensive IV.',
-                'Put Rec':   'Buy = bearish bias + cheap IV. Sell = bullish bias + expensive IV.',
-            }, **base_style)
 
 
 
