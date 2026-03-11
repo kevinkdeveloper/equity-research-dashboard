@@ -1,6 +1,7 @@
 import os
 import warnings
 warnings.filterwarnings('ignore', message='Parsing dates involving a day of month without a year')
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
 load_dotenv()
 import requests
@@ -720,6 +721,10 @@ vol_surface_layout = html.Div([
                 style={'marginBottom': '10px'},
             ),
 
+            html.Label("Animation Lookback", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block', 'marginTop': '10px'}),
+            dcc.Slider(id='vol-anim-lookback', min=0, max=4, step=1, value=0,
+                       marks={0: '1Y', 1: '2Y', 2: '3Y', 3: '5Y', 4: 'MAX'},
+                       tooltip={'always_visible': False}),
             html.Div(style={'display': 'flex', 'flexDirection': 'column', 'gap': '6px', 'marginTop': '6px'}, children=[
                 html.Button('Fetch (ORATS)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
             ]),
@@ -730,12 +735,28 @@ vol_surface_layout = html.Div([
         ]),
         html.Div(style=CONTENT_STYLE, children=[
             dcc.Store(id='vol-data-store'),
+            dcc.Store(id='vol-anim-store'),
             dcc.Tabs(id='vol-view-tabs', value='tab-surface', style={'marginBottom': '10px'}, children=[
                 dcc.Tab(label='3D Surface', value='tab-surface',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666'},
                         selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"},
                         children=[
                             dcc.Loading(dcc.Graph(id='vol-surface-chart', style={'height': '65vh', 'minHeight': '450px'}), type='circle'),
+                        ]),
+                dcc.Tab(label='Animation', value='tab-vol-anim',
+                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
+                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"},
+                        children=[
+                            dcc.Graph(id='vol-anim-chart', style={'height': '55vh', 'minHeight': '400px'}),
+                            html.Div(style={'padding': '0 16px', 'paddingBottom': '90px', 'marginTop': '4px'}, children=[
+                                dcc.Slider(id='vol-anim-slider', min=0, max=0, step=1, value=0, marks={},
+                                           tooltip={'always_visible': False}),
+                            ]),
+                            html.Div(style={'padding': '4px 16px'}, children=[
+                                html.Button('▶ Play', id='vol-anim-play-btn', n_clicks=0,
+                                            style={**BUTTON_STYLE, 'width': '120px'}),
+                            ]),
+                            dcc.Interval(id='vol-anim-interval', interval=150, n_intervals=0, disabled=True),
                         ]),
                 dcc.Tab(label='Smile Slice', value='tab-smile',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666'},
@@ -1598,6 +1619,60 @@ def render_scanner_table(data, tab_value):
 
 
 
+def _fetch_one_surface_date(ticker, date_str):
+    """Fetch monies/implied for a single tradeDate. Returns list of row dicts."""
+    url = (
+        'https://api.orats.io/datav2/hist/monies/implied'
+        f'?token={ORATS_API_KEY}&ticker={ticker}&tradeDate={date_str}'
+    )
+    resp = requests.get(url, timeout=30)
+    if resp.status_code == 200:
+        return resp.json().get('data', [])
+    return []
+
+
+def fetch_orats_hist_surface(ticker_symbol, lookback_days=365*2):
+    """Fetch historical monies/implied data from ORATS for animated 3D vol surface.
+
+    The ORATS API does not support date-range filtering on this endpoint —
+    no-date fetch returns the full history (502), comma-range gives 404.
+    Instead we generate monthly sample dates and fetch each one in parallel.
+    """
+    if not ORATS_API_KEY:
+        return None, 'ORATS_API_KEY not set.'
+    try:
+        ticker = ticker_symbol.upper()
+        today  = pd.Timestamp.today().normalize()
+        start  = today - pd.Timedelta(days=lookback_days) if lookback_days else pd.Timestamp('2010-01-01')
+
+        # Generate ~monthly sample dates (every 21 trading days ≈ 1 month)
+        date_range = pd.bdate_range(start=start, end=today, freq='1B')
+        # Always include the most recent business day
+        last_bday = pd.bdate_range(end=today, periods=1)[0]
+        dates = sorted(set(date_range.tolist() + [last_bday]))
+        date_strs = [d.strftime('%Y-%m-%d') for d in dates]
+
+        all_rows = []
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(_fetch_one_surface_date, ticker, ds): ds for ds in date_strs}
+            for fut in as_completed(futures):
+                all_rows.extend(fut.result())
+
+        if not all_rows:
+            return None, f'No monies data returned for {ticker}'
+
+        df = pd.DataFrame(all_rows)
+        df['tradeDate'] = pd.to_datetime(df['tradeDate'])
+        df['expirDate'] = pd.to_datetime(df['expirDate'])
+        df['dte']       = (df['expirDate'] - df['tradeDate']).dt.days
+        df = df[(df['dte'] >= 7) & (df['dte'] <= 365)]
+        df = df.drop_duplicates(subset=['tradeDate', 'expirDate'])
+        df = df.sort_values(['tradeDate', 'dte']).reset_index(drop=True)
+        return df, None
+    except Exception as e:
+        return None, str(e)
+
+
 # --- VOL ANALYSIS CALLBACKS ---
 
 @app.callback(
@@ -1681,12 +1756,220 @@ def update_vol_analysis(_n, ticker_symbol, slider_val):
     return store, stats
 
 
+_LOOKBACK_MAP = {0: 365, 1: 365*2, 2: 365*3, 3: 365*5, 4: None}
+
+@app.callback(
+    Output('vol-anim-store', 'data'),
+    Input('vol-submit-btn', 'n_clicks'),
+    [State('vol-ticker-input', 'value'), State('vol-anim-lookback', 'value')],
+    prevent_initial_call=True,
+)
+def fetch_surface_anim_data(_n, ticker_symbol, lookback_val):
+    import re
+    if not ticker_symbol:
+        return None
+
+    sym           = ticker_symbol.strip().upper()
+    lookback_days = _LOOKBACK_MAP.get(lookback_val if lookback_val is not None else 0, 365)
+
+    # 1. Pull ORATS monies/implied history
+    df, err = fetch_orats_hist_surface(sym, lookback_days=lookback_days)
+    if err or df is None:
+        return {'error': err or 'No data returned.'}
+
+    # 2. Identify vol columns (vol0…vol100 = call-delta × 100)
+    vol_cols = sorted(
+        [c for c in df.columns if re.match(r'^vol(\d+)$', c)],
+        key=lambda c: int(c[3:]),
+    )
+    if not vol_cols:
+        return {'error': 'No vol columns found. Columns: ' + ', '.join(df.columns)}
+
+    delta_levels = [int(c[3:]) for c in vol_cols]
+
+    for col in vol_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce') * 100.0  # decimal → %
+
+    sorted_dates = sorted(df['tradeDate'].unique())
+
+    # 3. Fetch spot prices from yfinance
+    hist = yf.download(
+        sym,
+        start=pd.Timestamp(sorted_dates[0])  - pd.Timedelta(days=5),
+        end=pd.Timestamp(sorted_dates[-1]) + pd.Timedelta(days=5),
+        auto_adjust=True, progress=False,
+    )
+    if hist.empty:
+        return {'error': f'Could not download price history for {sym}.'}
+
+    prices = hist['Close'].squeeze()
+    prices.index = pd.to_datetime(prices.index).normalize()
+
+    spot_map = {}
+    for d in sorted_dates:
+        avail = prices.index[prices.index <= pd.Timestamp(d)]
+        spot_map[d] = float(prices.loc[avail[-1]]) if len(avail) else None
+
+    valid_prices = [v for v in spot_map.values() if v]
+    if not valid_prices:
+        return {'error': 'No valid spot prices found.'}
+
+    # 4. Fixed strike & DTE grids (consistent across all frames)
+    global_lo   = min(valid_prices) * 0.75
+    global_hi   = max(valid_prices) * 1.25
+    strike_grid = np.round(np.linspace(global_lo, global_hi, 30), 2)
+    dte_grid    = np.array([14, 21, 30, 45, 60, 90, 120, 180, 252, 365])
+
+    # 5. Build one interpolated IV surface per trade date
+    z_frames = []
+    for d in sorted_dates:
+        S   = spot_map[d]
+        sub = df[df['tradeDate'] == d]
+        pts, vals = [], []
+
+        for _, row in sub.iterrows():
+            dte_val = float(row['dte'])
+            T       = dte_val / 252.0
+            if T <= 0 or not S:
+                continue
+            sqrt_T = np.sqrt(T)
+            for col, d_x100 in zip(vol_cols, delta_levels):
+                iv_pct = row[col]
+                if pd.notna(iv_pct) and iv_pct > 0 and 0 < d_x100 < 100:
+                    sigma  = iv_pct / 100.0
+                    strike = S * np.exp(-norm.ppf(d_x100 / 100.0) * sigma * sqrt_T
+                                        + 0.5 * sigma ** 2 * T)
+                    if global_lo <= strike <= global_hi:
+                        pts.append((dte_val, strike))
+                        vals.append(iv_pct)
+
+        if len(pts) < 4:
+            z_frames.append(np.full((len(dte_grid), len(strike_grid)), np.nan).tolist())
+            continue
+
+        pts_arr  = np.array(pts)
+        vals_arr = np.array(vals)
+        tgt_dte    = dte_grid[:, None]              * np.ones(len(strike_grid))
+        tgt_strike = np.ones(len(dte_grid))[:, None] * strike_grid
+
+        grid = griddata(pts_arr, vals_arr, (tgt_dte, tgt_strike), method='linear')
+        nans = np.isnan(grid)
+        if nans.any():
+            grid[nans] = griddata(pts_arr, vals_arr, (tgt_dte, tgt_strike), method='nearest')[nans]
+
+        z_frames.append(np.round(grid, 2).tolist())
+
+    return {
+        'sym':         sym,
+        'dates':       [pd.Timestamp(d).strftime('%Y-%m-%d') for d in sorted_dates],
+        'strike_grid': strike_grid.tolist(),
+        'dte_grid':    dte_grid.tolist(),
+        'z_frames':    z_frames,
+    }
+
+
+@app.callback(
+    [Output('vol-anim-chart', 'figure'),
+     Output('vol-anim-slider', 'value'),
+     Output('vol-anim-slider', 'min'),
+     Output('vol-anim-slider', 'max'),
+     Output('vol-anim-slider', 'marks')],
+    [Input('vol-anim-store', 'data'),
+     Input('vol-anim-slider', 'value'),
+     Input('vol-anim-interval', 'n_intervals')],
+)
+def render_vol_animation(anim_data, slider_idx, _n_intervals):
+    empty = go.Figure(layout=layout_settings)
+
+    if not anim_data:
+        empty.add_annotation(text='Click "Fetch (ORATS)" to load the animation.',
+                             x=0.5, y=0.5, xref='paper', yref='paper',
+                             showarrow=False, font=dict(color=colors['muted'], size=14))
+        return empty, 0, 0, 0, {}
+
+    if 'error' in anim_data:
+        empty.add_annotation(text=anim_data['error'],
+                             x=0.5, y=0.5, xref='paper', yref='paper',
+                             showarrow=False, font=dict(color='#f66', size=13))
+        return empty, 0, 0, 0, {}
+
+    dates       = anim_data['dates']
+    n           = len(dates)
+    strike_grid = anim_data['strike_grid']
+    dte_grid    = anim_data['dte_grid']
+    z_frames    = anim_data['z_frames']
+    sym         = anim_data['sym']
+
+    if ctx.triggered_id == 'vol-anim-interval':
+        frame_idx = ((slider_idx or 0) + 1) % n
+    else:
+        frame_idx = min(max(slider_idx or 0, 0), n - 1)
+
+    marks = {
+        i: {'label': dates[i], 'style': {
+            'color': '#aaa', 'fontSize': '10px', 'whiteSpace': 'nowrap',
+            'transform': 'rotate(-90deg)', 'transformOrigin': 'top center',
+            'marginTop': '28px', 'display': 'inline-block',
+        }}
+        for i in range(n)
+    }
+
+    all_vals = [v for frame in z_frames for row in frame for v in row
+                if v is not None and not np.isnan(v)]
+    zmin = float(np.percentile(all_vals,  2)) if all_vals else 0
+    zmax = float(np.percentile(all_vals, 98)) if all_vals else 100
+
+    fig = go.Figure(data=[go.Surface(
+        x=strike_grid,
+        y=dte_grid,
+        z=z_frames[frame_idx],
+        colorscale='RdYlGn_r',
+        cmin=zmin, cmax=zmax,
+        colorbar=dict(title='IV %', tickfont=dict(color='#ccc'), titlefont=dict(color='#ccc')),
+        hovertemplate='Strike: $%{x:.2f}<br>DTE: %{y}d<br>IV: %{z:.1f}%<extra></extra>',
+    )])
+    fig.update_layout(
+        **layout_settings,
+        uirevision='vol-surface',
+        title=dict(text=f'{sym} — {dates[frame_idx]}', font=dict(color=colors['text'], size=14)),
+        scene=dict(
+            xaxis=dict(title='Strike ($)', color='#aaa', gridcolor='#333'),
+            yaxis=dict(title='DTE (days)', color='#aaa', gridcolor='#333'),
+            zaxis=dict(title='IV %',       color='#aaa', gridcolor='#333',
+                       range=[max(0, zmin * 0.9), zmax * 1.1]),
+            bgcolor=colors['card_bg'],
+            camera=dict(
+                eye=dict(x=-1.5, y=-1.8, z=0.8),
+                center=dict(x=0, y=0, z=-0.1),
+            ),
+        ),
+        margin=dict(l=10, r=10, t=40, b=10),
+    )
+    return fig, frame_idx, 0, n - 1, marks
+
+
+@app.callback(
+    [Output('vol-anim-interval', 'disabled'),
+     Output('vol-anim-play-btn', 'children'),
+     Output('vol-anim-play-btn', 'style')],
+    Input('vol-anim-play-btn', 'n_clicks'),
+    State('vol-anim-interval', 'disabled'),
+    prevent_initial_call=True,
+)
+def toggle_anim_interval(_, is_disabled):
+    playing   = is_disabled   # was paused → now playing
+    btn_style = {**BUTTON_STYLE, 'width': '120px',
+                 'backgroundColor': '#444', 'color': '#aaa'} if playing else {**BUTTON_STYLE, 'width': '120px'}
+    return not playing, ('⏸ Pause' if playing else '▶ Play'), btn_style
+
+
 @app.callback(
     Output('vola-chart', 'figure'),
     [Input('vola-data-store', 'data'), Input('vola-view-tabs', 'value')],
 )
 def render_vola_chart(data, tab_value):
     empty_fig = go.Figure(layout=layout_settings)
+
     if not data or 'error' in data:
         return empty_fig
 
