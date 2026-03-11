@@ -1,4 +1,5 @@
 import os
+import time
 import warnings
 warnings.filterwarnings('ignore', message='Parsing dates involving a day of month without a year')
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -467,31 +468,6 @@ def scan_ticker_orats(ticker_symbol, target_dte=30):
         return {'Ticker': ticker_symbol, '_error': f'ORATS error: {e}'}
 
 
-def fetch_orats_hist_iv(ticker_symbol):
-    """Fetch full historical daily IV/HV from ORATS /hist/summaries. Returns (DataFrame, error_string)."""
-    if not ORATS_API_KEY:
-        return None, "ORATS_API_KEY not set."
-    try:
-        params = {'token': ORATS_API_KEY, 'ticker': ticker_symbol.upper()}
-        resp = requests.get(
-            'https://api.orats.io/datav2/hist/summaries',
-            params=params,
-            timeout=20
-        )
-        if resp.status_code in (401, 403):
-            return None, "ORATS key unauthorized."
-        resp.raise_for_status()
-        rows = resp.json().get('data', [])
-        if not rows:
-            return None, f"No ORATS historical data for {ticker_symbol}"
-        df = pd.DataFrame(rows)
-        df['tradeDate'] = pd.to_datetime(df['tradeDate'])
-        df = df.sort_values('tradeDate').reset_index(drop=True)
-        return df, None
-    except requests.exceptions.Timeout:
-        return None, "ORATS request timed out"
-    except Exception as e:
-        return None, f"ORATS error: {e}"
 
 
 # -----------------------------------------------------------------------------
@@ -727,7 +703,10 @@ vol_surface_layout = html.Div([
                        tooltip={'always_visible': False}),
             html.Div(style={'display': 'flex', 'flexDirection': 'column', 'gap': '6px', 'marginTop': '6px'}, children=[
                 html.Button('Fetch (ORATS)', id='vol-submit-btn', n_clicks=0, style=BUTTON_STYLE),
+                html.Span(id='vol-timer', style={'color': '#888', 'fontSize': '12px', 'fontFamily': 'monospace', 'minHeight': '16px'}),
             ]),
+            dcc.Store(id='vol-timer-store'),
+            dcc.Interval(id='vol-timer-interval', interval=250, n_intervals=0, disabled=True),
             html.Hr(className='section-divider'),
             html.Div(id='vol-info-display', children=html.Div([
                 html.P("Surface data will appear here after fetch.", style={'color': colors['muted'], 'fontStyle': 'italic'})
@@ -785,6 +764,9 @@ scanner_layout = html.Div([
                          style={**INPUT_STYLE, 'height': '80px', 'resize': 'vertical', 'fontFamily': 'monospace'}),
             html.Button('Scan (ORATS)', id='scanner-polygon-btn', n_clicks=0,
                         style={**BUTTON_STYLE, 'marginTop': '8px'}),
+            html.Span(id='scan-timer', style={'display': 'block', 'color': '#888', 'fontSize': '12px', 'fontFamily': 'monospace', 'marginTop': '4px', 'minHeight': '16px'}),
+            dcc.Store(id='scan-timer-store'),
+            dcc.Interval(id='scan-timer-interval', interval=250, n_intervals=0, disabled=True),
             html.Div(id='scanner-status', style={'color': colors['muted'], 'fontSize': '0.8em', 'fontStyle': 'italic', 'marginTop': '4px'}),
         ]),
         html.Div(style=CONTENT_STYLE, children=[
@@ -820,6 +802,9 @@ cal_layout = html.Div([
                        tooltip={"always_visible": False}),
             html.Button('Load Calendar', id='cal-submit-btn', n_clicks=0,
                         style={**BUTTON_STYLE, 'marginTop': '14px'}),
+            html.Span(id='cal-timer', style={'display': 'block', 'color': '#888', 'fontSize': '12px', 'fontFamily': 'monospace', 'marginTop': '4px', 'minHeight': '16px'}),
+            dcc.Store(id='cal-timer-store'),
+            dcc.Interval(id='cal-timer-interval', interval=250, n_intervals=0, disabled=True),
             html.Hr(className='section-divider'),
             html.Div(id='cal-stats-display',
                      children=html.Div("Stats will appear here after loading.",
@@ -832,67 +817,55 @@ cal_layout = html.Div([
 ])
 
 # --- 4b. VOL ANALYSIS TAB LAYOUT ---
-vol_analysis_layout = html.Div([
+# --- 6. BACKTESTER TAB LAYOUT ---
+backtest_layout = html.Div([
     html.Div(style=FLEX_WRAPPER_STYLE, children=[
         html.Div(style=SIDEBAR_STYLE, children=[
-            html.H3("Vol Analysis", style={'color': colors['accent'], 'marginBottom': '4px'}),
-            html.P("Historical implied & realized volatility powered by ORATS.", className='helper-text', style={'marginTop': '0'}),
+            html.H3("Skew Backtester", style={'color': colors['accent'], 'marginBottom': '8px'}),
 
-            html.Label("Ticker Symbol", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
-            dcc.Input(id='vola-ticker-input', type='text', value='SPY', placeholder='e.g. SPY, AAPL',
+            html.Label("Ticker", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em'}),
+            dcc.Input(id='bt-ticker-input', type='text', value='SPY',
+                      placeholder='e.g. SPY, AAPL, TSLA',
                       style={**INPUT_STYLE, 'marginBottom': '12px'}),
 
-            html.Label("Date Range", style={'color': colors['text'], 'fontWeight': 'bold', 'display': 'block', 'fontSize': '0.9em', 'marginTop': '4px', 'marginBottom': '4px'}),
-            html.Div("Drag both handles to set start and end.", className='helper-text'),
-            html.Div(style={'padding': '0 10px 28px 10px'}, children=[
-                dcc.RangeSlider(
-                    id='vola-period-slider',
-                    min=0, max=11, step=1,
-                    value=[6, 11],
-                    marks={
-                        0:  {'label': 'MAX', 'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        1:  {'label': '10Y',  'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        2:  {'label': '7Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        3:  {'label': '5Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        4:  {'label': '3Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        5:  {'label': '2Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        6:  {'label': '1Y',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        7:  {'label': '6M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        8:  {'label': '3M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        9:  {'label': '1M',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        10: {'label': '2W',   'style': {'color': '#888', 'fontSize': '0.75em'}},
-                        11: {'label': 'Now',  'style': {'color': '#888', 'fontSize': '0.75em'}},
-                    },
-                    tooltip={"always_visible": False},
-                )
+            html.Label("Lookback", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            html.Div(style={'padding': '0 8px 16px 8px'}, children=[
+                dcc.Slider(id='bt-lookback', min=0, max=4, step=1, value=4,
+                           marks={0: '6M', 1: '1Y', 2: '2Y', 3: '5Y', 4: 'MAX'},
+                           tooltip={'always_visible': False}),
             ]),
 
-            html.Button('Analyze', id='vola-analyze-btn', n_clicks=0, style=BUTTON_STYLE),
-            html.Hr(className='section-divider'),
-            html.Div(id='vola-stats-display', children=html.Div([
-                html.P("Stats will appear here after analysis.", style={'color': colors['muted'], 'fontStyle': 'italic'})
-            ]))
+            html.Label("Skew Tenor (DTE)", style={'color': colors['text'], 'fontWeight': 'bold', 'fontSize': '0.9em', 'display': 'block'}),
+            dcc.RadioItems(
+                id='bt-tenor',
+                options=[{'label': ' 30d', 'value': 30},
+                         {'label': ' 60d', 'value': 60},
+                         {'label': ' 90d', 'value': 90}],
+                value=60,
+                labelStyle={'display': 'inline-block', 'color': colors['text'],
+                            'marginRight': '12px', 'cursor': 'pointer'},
+                style={'marginBottom': '14px'},
+            ),
+
+            html.Button('Fetch (ORATS)', id='bt-fetch-btn', n_clicks=0,
+                        style={**BUTTON_STYLE, 'marginTop': '4px'}),
+            html.Span(id='bt-timer', style={'display': 'block', 'color': '#888', 'fontSize': '12px', 'fontFamily': 'monospace', 'marginTop': '4px', 'minHeight': '16px'}),
+            dcc.Store(id='bt-timer-store'),
+            dcc.Interval(id='bt-timer-interval', interval=250, n_intervals=0, disabled=True),
+            html.Div(id='bt-status', style={'color': colors['muted'], 'fontSize': '0.8em',
+                                            'marginTop': '8px', 'minHeight': '20px'}),
         ]),
 
         html.Div(style=CONTENT_STYLE, children=[
-            dcc.Store(id='vola-data-store'),
-            dcc.Tabs(id='vola-view-tabs', value='tab-vola-iv',
-                     style={'marginBottom': '10px'},
-                     children=[
-                dcc.Tab(label='IV / HV', value='tab-vola-iv',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
-                dcc.Tab(label='Greeks History', value='tab-vola-greeks',
-                        style={'backgroundColor': colors['card_bg'], 'color': '#666'},
-                        selected_style={'backgroundColor': colors['card_bg'], 'color': colors['accent'], 'borderTop': f"2px solid {colors['accent']}"}),
-            ]),
-            dcc.Loading(dcc.Graph(id='vola-chart', style={'height': '72vh', 'minHeight': '480px'}), type='circle'),
-        ])
+            dcc.Store(id='backtest-store'),
+            dcc.Graph(id='bt-price-chart',
+                      style={'height': '82vh', 'minHeight': '540px'}),
+            dcc.Graph(id='bt-skew-chart', style={'display': 'none'}),
+        ]),
     ])
 ])
 
 # --- APP LAYOUT ---
-# CHANGE: Revamped header with subtitle, added footer
 app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight': '100vh', 'padding': '10px 20px 0 20px', 'fontFamily': "'Segoe UI', Arial, sans-serif"}, children=[
 
     # CHANGE: Revamped header with subtitle and visual separator
@@ -922,16 +895,16 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
                 dcc.Tab(label='Vol Surface', value='tab-vol',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
-                dcc.Tab(label='Vol Analysis', value='tab-vola',
+                dcc.Tab(label='Backtester', value='tab-backtest',
                         style={'backgroundColor': colors['card_bg'], 'color': '#666', 'border': 'none', 'padding': '12px', 'fontWeight': 'bold'},
                         selected_style={'backgroundColor': '#1a1a1a', 'color': colors['accent'], 'borderTop': f"3px solid {colors['accent']}", 'padding': '12px'}),
     ]),
 
-    html.Div(id='spread-content-wrapper', children=spread_layout, style={'display': 'none'}),
-    html.Div(id='cal-content-wrapper', children=cal_layout, style={'display': 'none'}),
-    html.Div(id='vol-content-wrapper', children=vol_surface_layout, style={'display': 'none'}),
-    html.Div(id='scanner-content-wrapper', children=scanner_layout, style={'display': 'block'}),
-    html.Div(id='vola-content-wrapper', children=vol_analysis_layout, style={'display': 'none'}),
+    html.Div(id='spread-content-wrapper',   children=spread_layout,    style={'display': 'none'}),
+    html.Div(id='cal-content-wrapper',      children=cal_layout,       style={'display': 'none'}),
+    html.Div(id='vol-content-wrapper',      children=vol_surface_layout, style={'display': 'none'}),
+    html.Div(id='scanner-content-wrapper',   children=scanner_layout,    style={'display': 'block'}),
+    html.Div(id='backtest-content-wrapper',  children=backtest_layout,   style={'display': 'none'}),
 
     # CHANGE: Added footer with context so the app feels polished
     html.Div(style={
@@ -951,19 +924,19 @@ app.layout = html.Div(style={'backgroundColor': colors['background'], 'minHeight
 
 # Tab Visibility Toggle
 @app.callback(
-    [Output('spread-content-wrapper', 'style'), Output('cal-content-wrapper', 'style'),
-     Output('vol-content-wrapper', 'style'), Output('scanner-content-wrapper', 'style'),
-     Output('vola-content-wrapper', 'style')],
+    [Output('spread-content-wrapper',  'style'), Output('cal-content-wrapper',     'style'),
+     Output('vol-content-wrapper',     'style'), Output('scanner-content-wrapper', 'style'),
+     Output('backtest-content-wrapper', 'style')],
     [Input('main-tabs', 'value')]
 )
 def toggle_tabs(tab_value):
-    spread_style, cal_style, vol_style, scanner_style, vola_style = [{'display': 'none'}] * 5
-    if tab_value == 'tab-spread':   spread_style  = {'display': 'block'}
-    elif tab_value == 'tab-cal':    cal_style     = {'display': 'block'}
-    elif tab_value == 'tab-vol':    vol_style     = {'display': 'block'}
-    elif tab_value == 'tab-scanner': scanner_style = {'display': 'block'}
-    elif tab_value == 'tab-vola':   vola_style    = {'display': 'block'}
-    return spread_style, cal_style, vol_style, scanner_style, vola_style
+    spread_style, cal_style, vol_style, scanner_style, bt_style = [{'display': 'none'}] * 5
+    if   tab_value == 'tab-spread':    spread_style  = {'display': 'block'}
+    elif tab_value == 'tab-cal':       cal_style     = {'display': 'block'}
+    elif tab_value == 'tab-vol':       vol_style     = {'display': 'block'}
+    elif tab_value == 'tab-scanner':   scanner_style = {'display': 'block'}
+    elif tab_value == 'tab-backtest':  bt_style      = {'display': 'block'}
+    return spread_style, cal_style, vol_style, scanner_style, bt_style
 
 # --- SPREAD ANALYSIS CALLBACK ---
 @app.callback(
@@ -1232,7 +1205,9 @@ def _build_surface_figure(data, sym, contract_type, z_axis, plot_type, moneyness
 @app.callback(
     [Output('vol-surface-chart', 'figure'), Output('vol-info-display', 'children'),
      Output('vol-data-store', 'data'), Output('vol-smile-expiry', 'marks'),
-     Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value')],
+     Output('vol-smile-expiry', 'max'), Output('vol-smile-expiry', 'value'),
+     Output('vol-timer-interval', 'disabled', allow_duplicate=True),
+     Output('vol-timer', 'children', allow_duplicate=True)],
     [Input('vol-submit-btn', 'n_clicks'),
      Input('vol-plot-type', 'value'),
      Input('vol-z-axis', 'value'),
@@ -1250,38 +1225,40 @@ def update_vol_surface(_n_poly, plot_type, z_axis, dte_range, ticker_symbol, con
     # --- Re-render from cache (no fetch) when only display toggles changed ---
     if triggered in ('vol-plot-type', 'vol-z-axis', 'vol-dte-range'):
         if not stored_data:
-            return no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
         sym           = (ticker_symbol or '').upper().strip()
         moneyness_pct = (moneyness_slider or 25) / 100
         fig, _, _, _ = _build_surface_figure(stored_data, sym, contract_type, z_axis, plot_type, moneyness_pct, dte_range)
         if fig is None:
-            return no_update, no_update, no_update, no_update, no_update, no_update
-        return fig, no_update, no_update, no_update, no_update, no_update
+            return no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
+        return fig, no_update, no_update, no_update, no_update, no_update, no_update, no_update
 
     # --- Fetch fresh data ---
+    _t0 = time.time()
     if not ticker_symbol:
-        return empty_fig, html.Div(), no_update, no_update, no_update, no_update
+        return empty_fig, html.Div(), no_update, no_update, no_update, no_update, True, ''
 
     sym           = ticker_symbol.upper().strip()
     moneyness_pct = (moneyness_slider or 25) / 100
 
     data, err    = fetch_orats_surface(sym, contract_type, moneyness_pct)
     source_label = "ORATS"
+    elapsed = time.time() - _t0
 
     if err:
         info = html.Div([
             html.Div(f"{source_label} fetch failed", style={'color': colors['danger'], 'fontWeight': 'bold', 'marginBottom': '4px'}),
             html.Div(err, style={'color': colors['muted'], 'fontSize': '0.85em'}),
         ])
-        return empty_fig, info, no_update, no_update, no_update, no_update
+        return empty_fig, info, no_update, no_update, no_update, no_update, True, f'{elapsed:.1f}s'
 
     fig, info_html, smile_marks, smile_max = _build_surface_figure(
         data, sym, contract_type, z_axis, plot_type, moneyness_pct, dte_range)
     if fig is None:
-        return empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
-                                   style={'color': colors['danger']}), \
-               no_update, no_update, no_update, no_update
-    return fig, info_html, data, smile_marks, smile_max, 0
+        return (empty_fig, html.Div("Not enough price quotes. Switch to IV (%).",
+                                    style={'color': colors['danger']}),
+                no_update, no_update, no_update, no_update, True, f'{elapsed:.1f}s')
+    return fig, info_html, data, smile_marks, smile_max, 0, True, f'{elapsed:.1f}s ✓'
 
 
 # --- VOL SMILE SLICE CALLBACK ---
@@ -1380,14 +1357,17 @@ def update_vol_smile(drag_idx, value_idx, store_data, z_axis):
 
 # --- CALENDAR RETURNS CALLBACK ---
 @app.callback(
-    [Output('cal-heatmap-output', 'children'), Output('cal-stats-display', 'children')],
+    [Output('cal-heatmap-output', 'children'), Output('cal-stats-display', 'children'),
+     Output('cal-timer-interval', 'disabled', allow_duplicate=True),
+     Output('cal-timer', 'children', allow_duplicate=True)],
     [Input('cal-submit-btn', 'n_clicks')],
     [State('cal-ticker-input', 'value'), State('cal-period-slider', 'value')],
     prevent_initial_call=True
 )
 def run_calendar(_n_clicks, ticker_raw, slider_val):
+    _t0 = time.time()
     if not ticker_raw:
-        return html.Div("Enter a ticker and click Load.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), html.Div()
+        return html.Div("Enter a ticker and click Load.", style={'color': colors['muted'], 'fontStyle': 'italic', 'padding': '20px'}), html.Div(), True, ''
 
     ticker_sym = ticker_raw.strip().upper()
     period = CAL_PERIOD_MAP.get(slider_val, '5y')
@@ -1395,7 +1375,7 @@ def run_calendar(_n_clicks, ticker_raw, slider_val):
     try:
         hist = yf.Ticker(ticker_sym).history(period=period)
         if hist.empty:
-            return html.Div("No data found.", style={'color': colors['danger']}), html.Div()
+            return html.Div("No data found.", style={'color': colors['danger']}), html.Div(), True, f'{time.time()-_t0:.1f}s'
 
         monthly = hist['Close'].resample('ME').last()
         monthly_ret = monthly.pct_change().dropna() * 100
@@ -1470,33 +1450,37 @@ def run_calendar(_n_clicks, ticker_raw, slider_val):
             ret_color = colors['call_text'] if ret >= 0 else colors['put_text']
             stat_rows.append(make_stat_row(str(yr), f"{ret:+.1f}%", ret_color))
 
-        return dcc.Graph(figure=fig, config={'displayModeBar': False}), html.Div(stat_rows)
+        return dcc.Graph(figure=fig, config={'displayModeBar': False}), html.Div(stat_rows), True, f'{time.time()-_t0:.1f}s ✓'
 
     except Exception as e:
-        return html.Div(f"Error: {e}", style={'color': colors['danger']}), html.Div()
+        return html.Div(f"Error: {e}", style={'color': colors['danger']}), html.Div(), True, f'{time.time()-_t0:.1f}s'
 
 
 # --- SCANNER CALLBACKS ---
 
 @app.callback(
-    [Output('scanner-data-store', 'data'), Output('scanner-status', 'children')],
+    [Output('scanner-data-store', 'data'), Output('scanner-status', 'children'),
+     Output('scan-timer-interval', 'disabled', allow_duplicate=True),
+     Output('scan-timer', 'children', allow_duplicate=True)],
     Input('scanner-polygon-btn', 'n_clicks'),
     State('scanner-tickers-input', 'value'),
     prevent_initial_call=True
 )
 def run_scanner(_n, tickers_raw):
+    _t0 = time.time()
     if not tickers_raw:
-        return None, ""
+        return None, "", True, ''
     tickers = [t.strip().upper() for t in tickers_raw.split(',') if t.strip()]
     results = [scan_ticker_orats(t) for t in tickers]
     errors  = [r for r in results if r and '_error' in r]
     rows    = [r for r in results if r and '_error' not in r]
+    elapsed = time.time() - _t0
     if not rows:
         err_msg = errors[0]['_error'] if errors else "all tickers returned no data"
-        return {'error': err_msg}, ""
+        return {'error': err_msg}, "", True, f'{elapsed:.1f}s'
     now_et = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=4)
     status = f"Scanned {len(rows)}/{len(tickers)} via ORATS · {now_et.strftime('%H:%M:%S')} ET"
-    return {'rows': rows}, status
+    return {'rows': rows}, status, True, f'{elapsed:.1f}s ✓'
 
 
 @app.callback(
@@ -1672,88 +1656,6 @@ def fetch_orats_hist_surface(ticker_symbol, lookback_days=365*2):
     except Exception as e:
         return None, str(e)
 
-
-# --- VOL ANALYSIS CALLBACKS ---
-
-@app.callback(
-    [Output('vola-data-store', 'data'), Output('vola-stats-display', 'children')],
-    [Input('vola-analyze-btn', 'n_clicks')],
-    [State('vola-ticker-input', 'value'), State('vola-period-slider', 'value')],
-    prevent_initial_call=True
-)
-def update_vol_analysis(_n, ticker_symbol, slider_val):
-    if not ticker_symbol:
-        return None, html.Div()
-
-    sym   = ticker_symbol.strip().upper()
-    today = datetime.date.today()
-
-    _vola_date_map = {
-        0:  None,
-        1:  today - datetime.timedelta(days=365 * 10),
-        2:  today - datetime.timedelta(days=365 * 7),
-        3:  today - datetime.timedelta(days=365 * 5),
-        4:  today - datetime.timedelta(days=365 * 3),
-        5:  today - datetime.timedelta(days=365 * 2),
-        6:  today - datetime.timedelta(days=365),
-        7:  today - datetime.timedelta(days=182),
-        8:  today - datetime.timedelta(days=91),
-        9:  today - datetime.timedelta(days=30),
-        10: today - datetime.timedelta(days=14),
-        11: today,
-    }
-
-    start_idx, end_idx = (slider_val if isinstance(slider_val, list) else [6, 11])
-    start_date = _vola_date_map.get(start_idx)
-    end_date   = _vola_date_map.get(end_idx, today)
-
-    df, err = fetch_orats_hist_iv(sym)
-    if err:
-        return {'error': err}, html.Div(err, style={'color': colors['danger'], 'padding': '10px'})
-    if start_date:
-        df = df[df['tradeDate'] >= pd.Timestamp(start_date)]
-    if end_date and end_date != today:
-        df = df[df['tradeDate'] <= pd.Timestamp(end_date)]
-    df = df.reset_index(drop=True)
-
-    hist_kwargs = ({'start': start_date.isoformat(), 'end': (end_date + datetime.timedelta(days=1)).isoformat()}
-                   if start_date else {'period': 'max'})
-    price_series = yf.Ticker(sym).history(**hist_kwargs)['Close']
-
-    # Stats panel
-    iv_latest = df['iv30d'].iloc[-1]  * 100 if 'iv30d'  in df.columns and len(df) else None
-    hv_latest = df['rVol30'].iloc[-1] * 100 if 'rVol30' in df.columns and len(df) else None
-    iv_max    = df['iv30d'].max()     * 100 if 'iv30d'  in df.columns else None
-    iv_min    = df['iv30d'].min()     * 100 if 'iv30d'  in df.columns else None
-    iv_rank   = ((iv_latest - iv_min) / (iv_max - iv_min) * 100
-                 if iv_latest and iv_max and iv_min and iv_max != iv_min else None)
-    vrp       = (iv_latest / hv_latest if iv_latest and hv_latest else None)
-    g_latest  = bs_greeks_atm(price_series.iloc[-1] if not price_series.empty else 100, iv_latest or 20, 30)
-
-    stats = html.Div([
-        html.H4(f"{sym} Vol Summary", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-        make_stat_row("IV 30d (latest)",  f"{iv_latest:.1f}%"              if iv_latest  else "N/A"),
-        make_stat_row("HV 30d (latest)",  f"{hv_latest:.1f}%"              if hv_latest  else "N/A"),
-        make_stat_row("IV/HV (VRP)",      f"{vrp:.2f}x"                    if vrp        else "N/A"),
-        make_stat_row("IV Rank (period)", f"{iv_rank:.0f}%"                if iv_rank    else "N/A"),
-        make_stat_row("IV Range",         f"{iv_min:.1f}–{iv_max:.1f}%"    if iv_min and iv_max else "N/A"),
-        html.Hr(className='section-divider'),
-        html.H4("ATM Greeks (30d)", style={'color': colors['text'], 'marginBottom': '10px', 'fontSize': '1em'}),
-        make_stat_row("Vega ($/1% IV)",   f"${g_latest['vega']:.2f}"       if g_latest   else "N/A"),
-        make_stat_row("Theta ($/day)",    f"${g_latest['theta']:.2f}"      if g_latest   else "N/A", colors['put_text'] if g_latest else None),
-        make_stat_row("Θ/V ratio",        f"{abs(g_latest['theta']/g_latest['vega']):.3f}" if (g_latest and g_latest['vega']) else "N/A"),
-        make_stat_row("Data points",      str(len(df))),
-    ])
-
-    store = {
-        'sym': sym,
-        'iv_dates':    df['tradeDate'].dt.strftime('%Y-%m-%d').tolist() if 'tradeDate' in df.columns else [],
-        'iv30d':       df['iv30d'].tolist()  if 'iv30d'  in df.columns else [],
-        'rvol30':      df['rVol30'].tolist() if 'rVol30' in df.columns else [],
-        'price_dates': price_series.index.strftime('%Y-%m-%d').tolist() if not price_series.empty else [],
-        'prices':      price_series.values.tolist()                      if not price_series.empty else [],
-    }
-    return store, stats
 
 
 _LOOKBACK_MAP = {0: 365, 1: 365*2, 2: 365*3, 3: 365*5, 4: None}
@@ -1963,100 +1865,337 @@ def toggle_anim_interval(_, is_disabled):
     return not playing, ('⏸ Pause' if playing else '▶ Play'), btn_style
 
 
+# =============================================================================
+# BACKTESTER CALLBACKS
+# =============================================================================
+
+_BT_LOOKBACK_MAP = {0: 182, 1: 365, 2: 365*2, 3: 365*5, 4: None}
+
+
+def _fetch_skew_history(sym, lookback_days, target_dte=30):
+    """Fetch daily skew (vol75 − vol25 at target_dte) and spot price for sym."""
+    import re
+    today = pd.Timestamp.today().normalize()
+    start = today - pd.Timedelta(days=lookback_days) if lookback_days else pd.Timestamp('2010-01-01')
+
+    # Weekly samples — fast enough and sufficient for a skew chart
+    date_range = pd.bdate_range(start=start, end=today, freq='5B')
+    last_bday  = pd.bdate_range(end=today, periods=1)[0]
+    dates      = sorted(set(date_range.tolist() + [last_bday]))
+    date_strs  = [d.strftime('%Y-%m-%d') for d in dates]
+
+    all_rows = []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(_fetch_one_surface_date, sym, ds): ds for ds in date_strs}
+        for fut in as_completed(futures):
+            all_rows.extend(fut.result())
+
+    if not all_rows:
+        return None, f'No ORATS data returned for {sym}.'
+
+    df = pd.DataFrame(all_rows)
+    df['tradeDate'] = pd.to_datetime(df['tradeDate'])
+    df['expirDate'] = pd.to_datetime(df['expirDate'])
+    df['dte']       = (df['expirDate'] - df['tradeDate']).dt.days
+    df = df[(df['dte'] >= 7) & (df['dte'] <= 365)]
+
+    vol_cols = sorted([c for c in df.columns if re.match(r'^vol(\d+)$', c)],
+                      key=lambda c: int(c[3:]))
+    if not vol_cols:
+        return None, 'No vol columns in ORATS response.'
+
+    for col in vol_cols:
+        df[col] = pd.to_numeric(df[col], errors='coerce') * 100.0
+
+    records = []
+    for d, grp in df.groupby('tradeDate'):
+        # Pick the row with DTE closest to target_dte
+        best = grp.iloc[(grp['dte'] - target_dte).abs().argsort()[:1]]
+        row  = best.iloc[0]
+        v25  = row.get('vol25', np.nan)
+        v75  = row.get('vol75', np.nan)
+        if pd.notna(v25) and pd.notna(v75) and v25 > 0 and v75 > 0:
+            records.append({'date': d, 'skew': v75 - v25})   # put premium over call
+
+    if not records:
+        return None, 'Could not compute skew — vol25/vol75 columns missing.'
+
+    skew_df = pd.DataFrame(records).set_index('date').sort_index()
+
+    # Fetch spot price from yfinance
+    hist = yf.download(sym, start=skew_df.index[0] - pd.Timedelta(days=5),
+                       end=today + pd.Timedelta(days=2),
+                       auto_adjust=True, progress=False)
+    price_series = hist['Close'].squeeze() if not hist.empty else pd.Series(dtype=float)
+    price_series.index = pd.to_datetime(price_series.index).normalize()
+    skew_df['price'] = price_series.reindex(skew_df.index, method='ffill')
+
+    return skew_df, None
+
+
 @app.callback(
-    Output('vola-chart', 'figure'),
-    [Input('vola-data-store', 'data'), Input('vola-view-tabs', 'value')],
+    [Output('backtest-store', 'data'),
+     Output('bt-status', 'children'),
+     Output('bt-timer-interval', 'disabled', allow_duplicate=True),
+     Output('bt-timer', 'children', allow_duplicate=True)],
+    Input('bt-fetch-btn', 'n_clicks'),
+    [State('bt-ticker-input', 'value'),
+     State('bt-lookback', 'value'),
+     State('bt-tenor', 'value'),
+     State('backtest-store', 'data')],
+    prevent_initial_call=True,
 )
-def render_vola_chart(data, tab_value):
-    empty_fig = go.Figure(layout=layout_settings)
+def fetch_backtest(_, ticker, lookback_val, tenor, stored):
+    _t0 = time.time()
+    if not ticker:
+        return no_update, 'Enter a ticker.', True, ''
+    sym          = ticker.strip().upper()
+    lookback_days = _BT_LOOKBACK_MAP.get(lookback_val if lookback_val is not None else 1)
+    effective_tenor = tenor or 30
+    # Return cached data if same params
+    if (stored and stored.get('sym') == sym
+            and stored.get('tenor') == effective_tenor
+            and stored.get('lookback_val') == lookback_val):
+        return no_update, f'Already loaded {len(stored["dates"])} weeks for {sym} (cached).', True, 'cached'
+    skew_df, err = _fetch_skew_history(sym, lookback_days, target_dte=effective_tenor)
+    elapsed = time.time() - _t0
+    if err:
+        return None, f'Error: {err}', True, f'{elapsed:.1f}s'
+    data = {
+        'sym':         sym,
+        'tenor':       effective_tenor,
+        'lookback_val': lookback_val,
+        'dates':       skew_df.index.strftime('%Y-%m-%d').tolist(),
+        'skew':        skew_df['skew'].round(2).tolist(),
+        'price':       skew_df['price'].round(2).tolist(),
+    }
+    return data, f'Loaded {len(data["dates"])} weeks for {sym}.', True, f'{elapsed:.1f}s ✓'
 
-    if not data or 'error' in data:
-        return empty_fig
 
-    sym        = data.get('sym', '')
-    iv_dates   = pd.to_datetime(data['iv_dates'])
-    iv30d      = np.array(data['iv30d'])
-    rvol30     = np.array(data['rvol30'])
-    price_dates = pd.to_datetime(data['price_dates'])
-    prices      = np.array(data['prices'])
+@app.callback(
+    [Output('bt-price-chart', 'figure'),
+     Output('bt-skew-chart',  'figure')],
+    Input('backtest-store', 'data'),
+)
+def render_backtest(data):
+    empty = go.Figure(layout=layout_settings)
+    if not data:
+        empty.add_annotation(text='Click "Fetch (ORATS)" to load data.',
+                             x=0.5, y=0.5, xref='paper', yref='paper',
+                             showarrow=False, font=dict(color=colors['muted'], size=14))
+        return empty, empty
 
-    if tab_value == 'tab-vola-iv':
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
-                            subplot_titles=(f'{sym} Price', 'Implied & Realized Volatility (30d)'),
-                            row_heights=[0.4, 0.6])
-        if len(prices):
-            fig.add_trace(go.Scatter(x=price_dates, y=prices, mode='lines', name='Price',
-                                     line=dict(color='#ffffff', width=1.5),
-                                     hovertemplate='$%{y:.2f}<extra>Price</extra>'), row=1, col=1)
-        if len(iv30d):
-            fig.add_trace(go.Scatter(x=iv_dates, y=iv30d * 100, mode='lines', name='IV 30d',
-                                     line=dict(color=colors['accent'], width=1.5),
-                                     hovertemplate='%{y:.1f}%<extra>IV 30d</extra>'), row=2, col=1)
-        if len(rvol30):
-            fig.add_trace(go.Scatter(x=iv_dates, y=rvol30 * 100, mode='lines', name='HV 30d',
-                                     line=dict(color='#00c8ff', width=1.5, dash='dot'),
-                                     hovertemplate='%{y:.1f}%<extra>HV 30d</extra>'), row=2, col=1)
-        fig.update_yaxes(title_text='Price ($)', tickprefix='$', row=1, col=1)
-        fig.update_yaxes(title_text='Vol (%)', ticksuffix='%', row=2, col=1)
-        fig.update_xaxes(showgrid=True, gridcolor='#222', row=2, col=1)
+    sym    = data['sym']
+    tenor  = data['tenor']
+    dates  = data['dates']
+    skew   = data['skew']
+    prices = data['price']
 
-    else:  # tab-vola-greeks
-        # Align ORATS IV dates with yfinance price dates
-        price_df = pd.Series(prices, index=price_dates).rename('spot')
-        iv_df    = pd.DataFrame({'iv': iv30d}, index=iv_dates)
-        merged   = iv_df.join(price_df, how='inner').dropna()
+    # --- Compute signals ---
+    df = pd.DataFrame({'skew': skew, 'price': prices}, index=pd.to_datetime(dates))
 
-        if merged.empty:
-            return empty_fig
+    win = min(52, max(4, len(df) - 1))
+    df['skew_mean'] = df['skew'].rolling(win, min_periods=4).mean()
+    df['skew_std']  = df['skew'].rolling(win, min_periods=4).std().replace(0, np.nan)
+    df['zscore']    = (df['skew'] - df['skew_mean']) / df['skew_std']
+    df['momentum']  = df['skew'].diff(4)
+    skew_mean  = float(df['skew_mean'].iloc[-1]) if not df['skew_mean'].isna().all() else 0
+    mom_colors = ['#ff4444' if (v is not None and not np.isnan(v) and v > 0) else '#00c853'
+                  for v in df['momentum'].tolist()]
 
-        vegas, thetas, tv_ratios = [], [], []
-        for spot, iv_dec in zip(merged['spot'], merged['iv']):
-            g = bs_greeks_atm(spot, iv_dec * 100, 30)
-            if g:
-                vegas.append(g['vega'])
-                thetas.append(g['theta'])
-                tv_ratios.append(abs(g['theta'] / g['vega']) if g['vega'] else np.nan)
-            else:
-                vegas.append(np.nan); thetas.append(np.nan); tv_ratios.append(np.nan)
+    # ── Single figure, 2 rows, shared x-axis, secondary y on each row ──────────
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.62, 0.38],
+        vertical_spacing=0.04,
+        specs=[[{'secondary_y': True}], [{'secondary_y': True}]],
+    )
 
-        dates = merged.index
-        tv_arr = np.array(tv_ratios)
-        tv_median = np.nanmedian(tv_arr)
+    range_buttons = dict(
+        buttons=[
+            dict(count=1, label='1M', step='month', stepmode='backward'),
+            dict(count=3, label='3M', step='month', stepmode='backward'),
+            dict(count=6, label='6M', step='month', stepmode='backward'),
+            dict(count=1, label='1Y', step='year',  stepmode='backward'),
+            dict(count=2, label='2Y', step='year',  stepmode='backward'),
+            dict(count=3, label='3Y', step='year',  stepmode='backward'),
+            dict(count=5, label='5Y', step='year',  stepmode='backward'),
+            dict(count=10, label='10Y', step='year',  stepmode='backward'),
+            dict(step='all', label='ALL'),
+        ],
+        bgcolor=colors['card_bg'], activecolor=colors['accent'],
+        font=dict(color=colors['text'], size=11),
+    )
 
-        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05,
-                            subplot_titles=(f'{sym} ATM Vega ($/1% IV, per share)',
-                                            'Theta ($/day, per share)',
-                                            'Θ/V Ratio — Carry Efficiency'),
-                            row_heights=[0.33, 0.33, 0.34])
+    # Row 1 — price (primary) + skew mean ref + skew fill (secondary) + divergence (primary)
+    fig.add_trace(go.Scatter(
+        x=dates, y=prices, mode='lines', name=sym,
+        line=dict(color='#ffffff', width=1.5),
+        hovertemplate='%{x}<br>Price: $%{y:.2f}<extra></extra>',
+    ), row=1, col=1, secondary_y=False)
 
-        fig.add_trace(go.Scatter(x=dates, y=vegas, mode='lines', name='Vega',
-                                 line=dict(color=colors['accent'], width=1.5),
-                                 hovertemplate='$%{y:.3f}<extra>Vega</extra>'), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=[dates[0], dates[-1]], y=[skew_mean, skew_mean],
+        mode='lines', line=dict(color='#444', dash='dot', width=1),
+        hoverinfo='skip', showlegend=False,
+    ), row=1, col=1, secondary_y=True)
 
-        fig.add_trace(go.Scatter(x=dates, y=thetas, mode='lines', name='Theta',
-                                 line=dict(color=colors['put_text'], width=1.5),
-                                 hovertemplate='$%{y:.3f}<extra>Theta</extra>'), row=2, col=1)
+    fig.add_trace(go.Scatter(
+        x=dates, y=skew, mode='lines', name=f'{tenor}d Skew',
+        line=dict(color=colors['accent'], width=1.5),
+        fill='tozeroy', fillcolor='rgba(255,102,0,0.10)',
+        hovertemplate='%{x}<br>Skew: %{y:.2f}pp<extra></extra>',
+    ), row=1, col=1, secondary_y=True)
 
-        fig.add_trace(go.Scatter(x=dates, y=tv_ratios, mode='lines', name='Θ/V',
-                                 line=dict(color='#00c8ff', width=1.5),
-                                 hovertemplate='%{y:.4f}<extra>Θ/V</extra>'), row=3, col=1)
+    # Row 2 — z-score (primary) + momentum bars (secondary)
+    fig.add_trace(go.Scatter(
+        x=dates, y=df['zscore'].round(2).tolist(),
+        mode='lines', name='Skew Z-score',
+        line=dict(color='#00bfff', width=1.5),
+        hovertemplate='%{x}<br>Z-score: %{y:.2f}<extra></extra>',
+    ), row=2, col=1, secondary_y=False)
 
-        # Shade region where Θ/V > median (attractive short vol carry)
-        fig.add_hrect(y0=tv_median, y1=float(np.nanmax(tv_arr)) * 1.05,
-                      fillcolor='rgba(0,200,0,0.07)', line_width=0, row=3, col=1)
-        fig.add_hline(y=tv_median, line_dash='dash', line_color='#555', line_width=1,
-                      annotation_text=f'Median {tv_median:.4f}',
-                      annotation_font_color='#888', row=3, col=1)
+    fig.add_trace(go.Bar(
+        x=dates, y=df['momentum'].round(2).tolist(),
+        name='Skew Momentum (4w)', marker_color=mom_colors,
+        opacity=0.45,
+        hovertemplate='%{x}<br>Mom: %{y:.2f}pp<extra></extra>',
+    ), row=2, col=1, secondary_y=True)
 
-        fig.update_yaxes(title_text='Vega ($)', tickprefix='$', row=1, col=1)
-        fig.update_yaxes(title_text='Theta ($)', tickprefix='$', row=2, col=1)
-        fig.update_yaxes(title_text='Θ/V', row=3, col=1)
-        fig.update_xaxes(showgrid=True, gridcolor='#222', row=3, col=1)
+    # Axis styling
+    fig.update_xaxes(rangeslider_visible=False, color='#aaa', gridcolor='#222', row=1, col=1)
+    fig.update_xaxes(rangeselector=range_buttons, rangeslider_visible=False,
+                     color='#aaa', gridcolor='#222', row=2, col=1)
+    fig.update_yaxes(title_text='Price ($)',  color='#aaa',           gridcolor='#222',
+                     row=1, col=1, secondary_y=False)
+    fig.update_yaxes(title_text='Skew (pp)',  color=colors['accent'], gridcolor='#111',
+                     zeroline=True, zerolinecolor='#444',
+                     row=1, col=1, secondary_y=True)
+    fig.update_yaxes(title_text='Z-score',    color='#00bfff',        gridcolor='#222',
+                     zeroline=True, zerolinecolor='#444', range=[-3.5, 3.5],
+                     row=2, col=1, secondary_y=False)
+    fig.update_yaxes(title_text='Mom (pp)',   color='#888',           showgrid=False,
+                     row=2, col=1, secondary_y=True)
 
-    fig.update_layout(**layout_settings,
-                      legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='right', x=1),
-                      margin=dict(l=55, r=20, t=60, b=40))
-    return fig
+    # Z-score background bands and reference lines
+    fig.add_hrect(y0=1,    y1=3.5,  row=2, col=1,
+                  fillcolor='rgba(255,60,60,0.07)',  line_width=0, layer='below')
+    fig.add_hrect(y0=-3.5, y1=-1,   row=2, col=1,
+                  fillcolor='rgba(60,255,120,0.07)', line_width=0, layer='below')
+    for level in [-2, -1, 1, 2]:
+        fig.add_hline(y=level, row=2, col=1,
+                      line=dict(color='#333', width=1, dash='dot'))
+
+    fig.update_layout(
+        **layout_settings,
+        title=dict(text=f'{sym} — Price vs {tenor}d Put-Call Skew',
+                   font=dict(color=colors['text'], size=13)),
+        legend=dict(orientation='h', x=0, y=-0.1, xanchor='left', yanchor='top',
+                    font=dict(color='#aaa', size=11)),
+        margin=dict(l=55, r=65, t=50, b=60),
+        barmode='overlay',
+    )
+
+    return fig, go.Figure(layout=layout_settings)
+
+
+# ---------------------------------------------------------------------------
+# FETCH TIMER CALLBACKS
+# Each fetch button gets a start callback (on click) and a tick callback
+# (on interval). The API callbacks above stop the interval and show elapsed.
+# ---------------------------------------------------------------------------
+
+def _fmt(start):
+    return f'{time.time() - start:.1f}s' if start else '0.0s'
+
+
+# --- Vol Surface ---
+@app.callback(
+    [Output('vol-timer-store', 'data'),
+     Output('vol-timer-interval', 'disabled'),
+     Output('vol-timer', 'children')],
+    Input('vol-submit-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def start_vol_timer(_):
+    return time.time(), False, '0.0s'
+
+
+@app.callback(
+    Output('vol-timer', 'children', allow_duplicate=True),
+    Input('vol-timer-interval', 'n_intervals'),
+    State('vol-timer-store', 'data'),
+    prevent_initial_call=True,
+)
+def tick_vol_timer(_, start):
+    return _fmt(start)
+
+
+# --- Scanner ---
+@app.callback(
+    [Output('scan-timer-store', 'data'),
+     Output('scan-timer-interval', 'disabled'),
+     Output('scan-timer', 'children')],
+    Input('scanner-polygon-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def start_scan_timer(_):
+    return time.time(), False, '0.0s'
+
+
+@app.callback(
+    Output('scan-timer', 'children', allow_duplicate=True),
+    Input('scan-timer-interval', 'n_intervals'),
+    State('scan-timer-store', 'data'),
+    prevent_initial_call=True,
+)
+def tick_scan_timer(_, start):
+    return _fmt(start)
+
+
+# --- Calendar ---
+@app.callback(
+    [Output('cal-timer-store', 'data'),
+     Output('cal-timer-interval', 'disabled'),
+     Output('cal-timer', 'children')],
+    Input('cal-submit-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def start_cal_timer(_):
+    return time.time(), False, '0.0s'
+
+
+@app.callback(
+    Output('cal-timer', 'children', allow_duplicate=True),
+    Input('cal-timer-interval', 'n_intervals'),
+    State('cal-timer-store', 'data'),
+    prevent_initial_call=True,
+)
+def tick_cal_timer(_, start):
+    return _fmt(start)
+
+
+# --- Backtester ---
+@app.callback(
+    [Output('bt-timer-store', 'data'),
+     Output('bt-timer-interval', 'disabled'),
+     Output('bt-timer', 'children')],
+    Input('bt-fetch-btn', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def start_bt_timer(_):
+    return time.time(), False, '0.0s'
+
+
+@app.callback(
+    Output('bt-timer', 'children', allow_duplicate=True),
+    Input('bt-timer-interval', 'n_intervals'),
+    State('bt-timer-store', 'data'),
+    prevent_initial_call=True,
+)
+def tick_bt_timer(_, start):
+    return _fmt(start)
 
 
 if __name__ == '__main__':
