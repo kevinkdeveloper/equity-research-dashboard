@@ -1945,18 +1945,13 @@ def _fetch_skew_history(sym, lookback_days, target_dte=30):
      State('backtest-store', 'data')],
     prevent_initial_call=True,
 )
-def fetch_backtest(_, ticker, lookback_val, tenor, stored):
+def fetch_backtest(_, ticker, lookback_val, tenor, _stored):
     _t0 = time.time()
     if not ticker:
         return no_update, 'Enter a ticker.', True, ''
     sym          = ticker.strip().upper()
     lookback_days = _BT_LOOKBACK_MAP.get(lookback_val if lookback_val is not None else 1)
     effective_tenor = tenor or 30
-    # Return cached data if same params
-    if (stored and stored.get('sym') == sym
-            and stored.get('tenor') == effective_tenor
-            and stored.get('lookback_val') == lookback_val):
-        return no_update, f'Already loaded {len(stored["dates"])} weeks for {sym} (cached).', True, 'cached'
     skew_df, err = _fetch_skew_history(sym, lookback_days, target_dte=effective_tenor)
     elapsed = time.time() - _t0
     if err:
