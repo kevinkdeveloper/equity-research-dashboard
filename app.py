@@ -854,6 +854,9 @@ backtest_layout = html.Div([
             dcc.Interval(id='bt-timer-interval', interval=250, n_intervals=0, disabled=True),
             html.Div(id='bt-status', style={'color': colors['muted'], 'fontSize': '0.8em',
                                             'marginTop': '8px', 'minHeight': '20px'}),
+            html.Button('Download CSV', id='bt-download-btn', n_clicks=0,
+                        style={**BUTTON_STYLE, 'marginTop': '8px', 'backgroundColor': '#1a3a1a', 'color': '#4caf50'}),
+            dcc.Download(id='bt-download'),
         ]),
 
         html.Div(style=CONTENT_STYLE, children=[
@@ -1873,13 +1876,27 @@ _BT_LOOKBACK_MAP = {0: 182, 1: 365, 2: 365*2, 3: 365*5, 4: None}
 
 
 def _fetch_skew_history(sym, lookback_days, target_dte=30):
-    """Fetch daily skew (vol75 − vol25 at target_dte) and spot price for sym."""
+    """Fetch skew history via per-date ORATS calls, sampling less frequently for longer lookbacks.
+
+    Sampling stride by lookback:
+      6M  → weekly  (~26 calls)
+      1Y  → weekly  (~52 calls)
+      2Y  → 2-week  (~52 calls)
+      5Y  → monthly (~60 calls)
+      MAX → monthly (~180 calls)
+    """
     import re
     today = pd.Timestamp.today().normalize()
     start = today - pd.Timedelta(days=lookback_days) if lookback_days else pd.Timestamp('2010-01-01')
 
-    # Weekly samples — fast enough and sufficient for a skew chart
-    date_range = pd.bdate_range(start=start, end=today, freq='5B')
+    if lookback_days and lookback_days <= 365:
+        freq = '5B'    # weekly
+    elif lookback_days and lookback_days <= 365 * 2:
+        freq = '10B'   # biweekly
+    else:
+        freq = '21B'   # monthly
+
+    date_range = pd.bdate_range(start=start, end=today, freq=freq)
     last_bday  = pd.bdate_range(end=today, periods=1)[0]
     dates      = sorted(set(date_range.tolist() + [last_bday]))
     date_strs  = [d.strftime('%Y-%m-%d') for d in dates]
@@ -1909,20 +1926,18 @@ def _fetch_skew_history(sym, lookback_days, target_dte=30):
 
     records = []
     for d, grp in df.groupby('tradeDate'):
-        # Pick the row with DTE closest to target_dte
         best = grp.iloc[(grp['dte'] - target_dte).abs().argsort()[:1]]
         row  = best.iloc[0]
         v25  = row.get('vol25', np.nan)
         v75  = row.get('vol75', np.nan)
         if pd.notna(v25) and pd.notna(v75) and v25 > 0 and v75 > 0:
-            records.append({'date': d, 'skew': v75 - v25})   # put premium over call
+            records.append({'date': d, 'skew': v75 - v25})
 
     if not records:
         return None, 'Could not compute skew — vol25/vol75 columns missing.'
 
     skew_df = pd.DataFrame(records).set_index('date').sort_index()
 
-    # Fetch spot price from yfinance
     hist = yf.download(sym, start=skew_df.index[0] - pd.Timedelta(days=5),
                        end=today + pd.Timedelta(days=2),
                        auto_adjust=True, progress=False)
@@ -2093,6 +2108,25 @@ def render_backtest(data):
     )
 
     return fig, go.Figure(layout=layout_settings)
+
+
+@app.callback(
+    Output('bt-download', 'data'),
+    Input('bt-download-btn', 'n_clicks'),
+    State('backtest-store', 'data'),
+    prevent_initial_call=True,
+)
+def download_backtest_csv(_, stored):
+    if not stored or not stored.get('dates'):
+        return no_update
+    sym   = stored.get('sym', 'ticker')
+    tenor = stored.get('tenor', '')
+    df = pd.DataFrame({
+        'date':  stored['dates'],
+        'price': stored['price'],
+        'skew':  stored['skew'],
+    })
+    return dcc.send_data_frame(df.to_csv, f'{sym}_skew_{tenor}d.csv', index=False)
 
 
 # ---------------------------------------------------------------------------
